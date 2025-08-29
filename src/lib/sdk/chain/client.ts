@@ -2,14 +2,8 @@
 import { createPublicClient, createWalletClient, custom, http } from "viem";
 import { env } from "../../env";
 
-export const l1Public = createPublicClient({
-  chain: { id: env.l1Id } as any,
-  transport: http(env.l1Url),
-});
-export const l2Public = createPublicClient({
-  chain: { id: env.l2Id } as any,
-  transport: http(env.l2Url),
-});
+export const l1Public = createPublicClient({ chain: { id: env.l1Id } as any, transport: http(env.l1Url) });
+export const l2Public = createPublicClient({ chain: { id: env.l2Id } as any, transport: http(env.l2Url) });
 
 export function walletL1() {
   if (!window.ethereum) throw new Error("MetaMask not found");
@@ -20,9 +14,7 @@ export function walletL2() {
   return createWalletClient({ chain: { id: env.l2Id } as any, transport: custom(window.ethereum) });
 }
 
-/** Ask MetaMask to switch networks */
 export async function switchTo(chainId: number) {
-  // 0x-prefixed hex per EIP-3085/3326
   const hex = "0x" + chainId.toString(16);
   await window.ethereum?.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
 }

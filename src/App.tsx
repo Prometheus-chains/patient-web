@@ -1,10 +1,11 @@
 import { useState } from "react";
 import {
   createPublicClient, createWalletClient, getContract,
-  custom, http, Hex, toHex
+  custom, http, toHex
 } from "viem";
+import type { Hex } from "viem";
 import stringify from "json-stable-stringify";
-import { sha256 } from "@noble/hashes/sha256";
+import { sha256 } from "@noble/hashes";
 
 // --- ENV from Vite (set these in Vercel) ---
 const env = {
