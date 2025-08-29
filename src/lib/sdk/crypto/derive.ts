@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 import { hkdf } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes";
+import { sha256 } from "@noble/hashes/sha256";
 
 /** tag(32) | key(32) | nonce(12) for AES-GCM */
 export function deriveTagKeyNonce(

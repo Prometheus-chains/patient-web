@@ -5,7 +5,7 @@ import {
 } from "viem";
 import type { Hex } from "viem";
 import stringify from "json-stable-stringify";
-import { sha256 } from "@noble/hashes";
+import { sha256 } from "@noble/hashes/sha256";
 
 // --- ENV from Vite (set these in Vercel) ---
 const env = {

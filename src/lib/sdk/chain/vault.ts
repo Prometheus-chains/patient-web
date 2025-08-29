@@ -8,12 +8,13 @@ export async function vaultPut(tag: Uint8Array, ciphertext: Uint8Array) {
   await switchTo(env.l2Id);
   const w = walletL2();
   const [account] = await w.getAddresses();
-  const tx = await w.writeContract({
+  const hash = await w.writeContract({
     address: env.vault,
     abi: vaultAbi,
     functionName: "put",
     args: [toHex(tag), toHex(ciphertext)],
-    account
+    account,
+    chain: undefined
   });
-  return l2Public.waitForTransactionReceipt({ hash: tx });
+  return l2Public.waitForTransactionReceipt({ hash });
 }

@@ -16,32 +16,34 @@ export async function ensureRecord(owner: Hex): Promise<Hex> {
 
   const w = walletL1();
   const [account] = await w.getAddresses();
-  const tx = await w.writeContract({
+  const hash = await w.writeContract({
     address: env.factory,
     abi: factoryAbi,
     functionName: "createRecord",
-    account
+    account,
+    chain: undefined
   });
-  await l1Public.waitForTransactionReceipt({ hash: tx });
+  await l1Public.waitForTransactionReceipt({ hash });
   rec = await recordOf(owner);
   return rec;
 }
 
 export async function getSeq(recordAddr: Hex): Promise<number> {
   const c = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
-  const val = await c.read.seq(); // no args
+  const val = await c.read.seq();
   return Number(val);
 }
 
 export async function anchorEvent(recordAddr: Hex, contentHash: Uint8Array) {
   const w = walletL1();
   const [account] = await w.getAddresses();
-  const tx = await w.writeContract({
+  const hash = await w.writeContract({
     address: recordAddr,
     abi: patientRecordAbi,
     functionName: "anchor",
     args: [toHex(contentHash), BigInt(env.l2Id)],
-    account
+    account,
+    chain: undefined
   });
-  return l1Public.waitForTransactionReceipt({ hash: tx });
+  return l1Public.waitForTransactionReceipt({ hash });
 }

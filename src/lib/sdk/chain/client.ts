@@ -6,15 +6,17 @@ export const l1Public = createPublicClient({ chain: { id: env.l1Id } as any, tra
 export const l2Public = createPublicClient({ chain: { id: env.l2Id } as any, transport: http(env.l2Url) });
 
 export function walletL1() {
-  if (!window.ethereum) throw new Error("MetaMask not found");
-  return createWalletClient({ chain: { id: env.l1Id } as any, transport: custom(window.ethereum) });
+   const eth = (window as any).ethereum;
+   if (!eth) throw new Error("MetaMask not found");
+   return createWalletClient({ chain: { id: env.l1Id } as any, transport: custom(eth) });
 }
 export function walletL2() {
-  if (!window.ethereum) throw new Error("MetaMask not found");
-  return createWalletClient({ chain: { id: env.l2Id } as any, transport: custom(window.ethereum) });
+    const eth = (window as any).ethereum;
+    if (!eth) throw new Error("MetaMask not found");
+    return createWalletClient({ chain: { id: env.l2Id } as any, transport: custom(eth) }); });
 }
 
 export async function switchTo(chainId: number) {
   const hex = "0x" + chainId.toString(16);
-  await window.ethereum?.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
+  await (window as any).ethereum?.request({ method: "wallet_switchEthereumChain", params: [{ chainId: hex }] });
 }
