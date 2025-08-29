@@ -33,8 +33,9 @@ const patientRecordAbi = [
 // --- VIEM clients ---
 const l1Public = createPublicClient({ chain: { id: env.l1Id } as any, transport: http(env.l1Url) });
 function walletL1() {
-  if (!window.ethereum) throw new Error("MetaMask not found");
-  return createWalletClient({ chain: { id: env.l1Id } as any, transport: custom(window.ethereum) });
+  const eth = (window as any).ethereum;
+  if (!eth) throw new Error("MetaMask not found");
+  return createWalletClient({ chain: { id: env.l1Id } as any, transport: custom(eth) });
 }
 
 export default function App() {
@@ -63,7 +64,14 @@ export default function App() {
 
     if (rec === "0x0000000000000000000000000000000000000000") {
       const w = walletL1();
-      const txHash = await w.writeContract({ address: env.factory, abi: factoryAbi, functionName: "createRecord" });
+	const [from] = await w.getAddresses();
+	const txHash = await w.writeContract({
+  	address: env.factory,
+  	abi: factoryAbi,
+  	functionName: "createRecord",
+  	account: from,
+  	chain: undefined
+	});
       await l1Public.waitForTransactionReceipt({ hash: txHash });
       rec = await factory.read.recordOf([account]) as Hex;
     }
@@ -93,11 +101,15 @@ export default function App() {
     if (!hashHex) { return alert("Compute the hash first"); }
     setStatus("Anchoring hash on L1…");
     const w = walletL1();
-    const c = getContract({ address: recordAddr, abi: patientRecordAbi, client: w });
-    const txHash = await w.writeContract({
-      address: recordAddr, abi: patientRecordAbi, functionName: "anchor",
-      args: [hashHex as Hex, BigInt(env.l2Id)]
-    });
+const [from] = await w.getAddresses();
+const txHash = await w.writeContract({
+  address: recordAddr,
+  abi: patientRecordAbi,
+  functionName: "anchor",
+  args: [hashHex as Hex, BigInt(env.l2Id)],
+  account: from,
+  chain: undefined
+});
     await l1Public.waitForTransactionReceipt({ hash: txHash });
     setStatus("✅ Anchored on L1. (Next: encrypt + store on L2, then anchor.)");
   }
