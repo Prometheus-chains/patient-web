@@ -5,7 +5,7 @@ import {
 } from "viem";
 import type { Hex } from "viem";
 import stringify from "json-stable-stringify";
-import { sha256 } from "@noble/hashes/sha256";
+import { hash as sha256Bytes } from "./lib/sdk/crypto/hash"; // <-- use local helper
 
 // --- ENV from Vite (set these in Vercel) ---
 const env = {
@@ -79,19 +79,18 @@ export default function App() {
     setStatus(`✅ Record ready: ${rec}`);
   }
 
-  function computeHash() {
-    try {
-      const obj = JSON.parse(jsonText);
-      // canonicalize (stable key order, no spaces) → bytes:
-      const canonical = new TextEncoder().encode(stringify(obj, { space: 0 }));
-      const digest = sha256(canonical);                 // Uint8Array(32)
-      const hex = toHex(digest);                        // 0x…
-      setHashHex(hex);
-      setStatus("✅ Canonical hash computed (ready to encrypt, store, anchor)");
-    } catch (e: any) {
-      setStatus("❌ JSON parse/canonicalize failed: " + (e?.message || String(e)));
-    }
+async function computeHash() {
+  try {
+    const obj = JSON.parse(jsonText);
+    const canonical = new TextEncoder().encode(stringify(obj, { space: 0 }));
+    const digest = await sha256Bytes(canonical);  // Uint8Array(32)
+    const hex = toHex(digest);                    // 0x…
+    setHashHex(hex);
+    setStatus("✅ Canonical hash computed (ready to anchor)");
+  } catch (e: any) {
+    setStatus("❌ JSON parse/canonicalize failed: " + (e?.message || String(e)));
   }
+}
 
   // (Optional) Anchor the hash now — useful to test L1 writes before wiring the vault/L2.
   async function anchorHash() {

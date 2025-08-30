@@ -13,7 +13,7 @@ export function walletL1() {
 export function walletL2() {
     const eth = (window as any).ethereum;
     if (!eth) throw new Error("MetaMask not found");
-    return createWalletClient({ chain: { id: env.l2Id } as any, transport: custom(eth) }); });
+    return createWalletClient({ chain: { id: env.l2Id } as any, transport: custom(eth) });
 }
 
 export async function switchTo(chainId: number) {
