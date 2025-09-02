@@ -12,6 +12,19 @@ const env = {
     factory: import.meta.env.VITE_FACTORY_ADDRESS,
     vault: import.meta.env.VITE_VAULT_ADDRESS,
 };
+// Known presets to help add chains if missing in MetaMask.
+const PRESETS = {
+    11155111: {
+        chainName: "Sepolia",
+        explorer: "https://sepolia.etherscan.io",
+        symbol: "ETH",
+    },
+    84532: {
+        chainName: "Base Sepolia",
+        explorer: "https://sepolia.basescan.org",
+        symbol: "ETH",
+    },
+};
 // --- Minimal ABIs ---
 const factoryAbi = [
     {
@@ -82,15 +95,40 @@ function walletL2() {
         throw new Error("MetaMask not found");
     return createWalletClient({ chain: { id: env.l2Id }, transport: custom(eth) });
 }
-async function ensureChain(targetId) {
+async function ensureChain(targetId, rpcUrl) {
     const eth = window.ethereum;
     if (!eth)
         throw new Error("MetaMask not found");
     const curHex = await eth.request({ method: "eth_chainId" });
     const cur = parseInt(curHex, 16);
-    if (cur !== targetId) {
-        const chainIdHex = `0x${targetId.toString(16)}`;
+    if (cur === targetId)
+        return;
+    const chainIdHex = `0x${targetId.toString(16)}`;
+    try {
         await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainIdHex }] });
+    }
+    catch (e) {
+        // 4902: Unrecognized chain — add it
+        if (e?.code === 4902) {
+            const p = PRESETS[targetId] || { chainName: `Chain ${targetId}`, explorer: "", symbol: "ETH" };
+            await eth.request({
+                method: "wallet_addEthereumChain",
+                params: [
+                    {
+                        chainId: chainIdHex,
+                        chainName: p.chainName,
+                        rpcUrls: rpcUrl ? [rpcUrl] : [""],
+                        nativeCurrency: { name: p.symbol, symbol: p.symbol, decimals: 18 },
+                        blockExplorerUrls: p.explorer ? [p.explorer] : [],
+                    },
+                ],
+            });
+            // Try switch again
+            await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainIdHex }] });
+        }
+        else {
+            throw e;
+        }
     }
 }
 // --- Crypto helpers ---
@@ -185,22 +223,23 @@ export default function App() {
         if (!account || account === "0x0000000000000000000000000000000000000000") {
             return alert("Connect MetaMask first");
         }
-        await ensureChain(env.l1Id);
+        await ensureChain(env.l1Id, env.l1Url);
         setStatus("Checking/creating your L1 PatientRecord…");
         const factory = getContract({ address: env.factory, abi: factoryAbi, client: l1Public });
         let rec = (await factory.read.recordOf([account]));
         if (rec === "0x0000000000000000000000000000000000000000") {
             const w = walletL1();
             const [from] = await w.getAddresses();
-            const txHash = await w.writeContract({
+            const { request } = await l1Public.simulateContract({
                 address: env.factory,
                 abi: factoryAbi,
                 functionName: "createRecord",
                 account: from,
-                chain: undefined,
             });
+            const txHash = await w.writeContract(request);
+            setStatus("Tx sent to create record — waiting for confirmation…");
             setLastTx(txHash);
-            await l1Public.waitForTransactionReceipt({ hash: txHash });
+            await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
             rec = (await factory.read.recordOf([account]));
         }
         setRecord(rec);
@@ -215,28 +254,34 @@ export default function App() {
             if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
                 return alert("Ensure your record first");
             }
-            await ensureChain(env.l1Id);
-            setStatus("Computing canonical hash & anchoring on L1…");
+            setStatus("Switching to L1…");
+            await ensureChain(env.l1Id, env.l1Url);
+            setStatus("Computing canonical hash…");
             const canonical = canonicalBytesFromJson(jsonText);
             const digest = await sha256Bytes(canonical);
             const hex = toHex(digest);
             setHashHex(hex);
             const w = walletL1();
             const [from] = await w.getAddresses();
-            const txHash = await w.writeContract({
+            // Preflight to surface ABI/arg errors immediately
+            setStatus("Preflighting anchor call…");
+            const { request } = await l1Public.simulateContract({
                 address: recordAddr,
                 abi: patientRecordAbi,
                 functionName: "anchor",
                 args: [hex, BigInt(env.l2Id)],
                 account: from,
-                chain: undefined,
             });
+            setStatus("Requesting wallet confirmation…");
+            const txHash = await w.writeContract(request);
             setLastTx(txHash);
-            await l1Public.waitForTransactionReceipt({ hash: txHash });
+            setStatus("Tx sent — waiting for 1 confirmation…");
+            await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
             setStatus("✅ Anchored on L1.");
         }
         catch (e) {
-            setStatus("❌ L1 anchor failed: " + (e?.message || String(e)));
+            console.error("anchor error", e);
+            setStatus("❌ L1 anchor failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
     async function encryptAndStoreL2() {
@@ -245,7 +290,8 @@ export default function App() {
                 return alert("Connect MetaMask first");
             if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000")
                 return alert("Ensure your record first");
-            await ensureChain(env.l2Id);
+            setStatus("Switching to L2…");
+            await ensureChain(env.l2Id, env.l2Url);
             setStatus("Encrypting and storing ciphertext on L2…");
             // Canonicalize & hash (for deterministic derivation)
             const canonical = canonicalBytesFromJson(jsonText);
@@ -255,21 +301,24 @@ export default function App() {
             const ctHex = toHex(ciphertext);
             const w = walletL2();
             const [from] = await w.getAddresses();
-            const txHash = await w.writeContract({
+            // Preflight
+            const { request } = await l2Public.simulateContract({
                 address: env.vault,
                 abi: vaultWriteAbi,
                 functionName: "put",
                 args: [tagHex, ctHex],
                 account: from,
-                chain: undefined,
             });
+            const txHash = await w.writeContract(request);
             setLastTx(txHash);
-            await l2Public.waitForTransactionReceipt({ hash: txHash });
+            setStatus("Tx sent — waiting for L2 confirmation…");
+            await l2Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
             setL2Tag(tagHex);
             setStatus("✅ Stored on L2 (ciphertext vault)");
         }
         catch (e) {
-            setStatus("❌ L2 store failed: " + (e?.message || String(e)));
+            console.error("l2 store error", e);
+            setStatus("❌ L2 store failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
     async function restoreFromSeed() {
@@ -310,7 +359,8 @@ export default function App() {
             setStatus(`✅ Restore complete (${okCount}/${out.length} verified)`);
         }
         catch (e) {
-            setStatus("❌ Restore failed: " + (e?.message || String(e)));
+            console.error("restore error", e);
+            setStatus("❌ Restore failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
     return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] })] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] })), l2Tag && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] })), lastTx && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] })), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore from seed" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "Seed never leaves your device. We derive tags/keys per-entry and verify against L1 hashes." }), _jsx("textarea", { rows: 3, style: { width: "100%" }, placeholder: "Enter your seed (mnemonic or passphrase)", value: seed, onChange: (e) => setSeed(e.target.value) }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromSeed, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] }))] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("p", { style: { opacity: 0.7, fontSize: 13, marginTop: 12 }, children: ["Tip: If your deployed vault uses ", _jsx("code", { children: "bytes32" }), " tags, update the ABI types (and derivation slice) accordingly."] })] }));

@@ -23,6 +23,20 @@ const env = {
   vault: import.meta.env.VITE_VAULT_ADDRESS as `0x${string}`,
 };
 
+// Known presets to help add chains if missing in MetaMask.
+const PRESETS: Record<number, { chainName: string; explorer: string; symbol: string }> = {
+  11155111: {
+    chainName: "Sepolia",
+    explorer: "https://sepolia.etherscan.io",
+    symbol: "ETH",
+  },
+  84532: {
+    chainName: "Base Sepolia",
+    explorer: "https://sepolia.basescan.org",
+    symbol: "ETH",
+  },
+};
+
 // --- Minimal ABIs ---
 const factoryAbi = [
   {
@@ -98,14 +112,36 @@ function walletL2() {
   return createWalletClient({ chain: { id: env.l2Id } as any, transport: custom(eth) });
 }
 
-async function ensureChain(targetId: number) {
+async function ensureChain(targetId: number, rpcUrl?: string) {
   const eth = (window as any).ethereum;
   if (!eth) throw new Error("MetaMask not found");
   const curHex: string = await eth.request({ method: "eth_chainId" });
   const cur = parseInt(curHex, 16);
-  if (cur !== targetId) {
-    const chainIdHex = `0x${targetId.toString(16)}`;
+  if (cur === targetId) return;
+  const chainIdHex = `0x${targetId.toString(16)}`;
+  try {
     await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainIdHex }] });
+  } catch (e: any) {
+    // 4902: Unrecognized chain — add it
+    if (e?.code === 4902) {
+      const p = PRESETS[targetId] || { chainName: `Chain ${targetId}`, explorer: "", symbol: "ETH" };
+      await eth.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: chainIdHex,
+            chainName: p.chainName,
+            rpcUrls: rpcUrl ? [rpcUrl] : [""],
+            nativeCurrency: { name: p.symbol, symbol: p.symbol, decimals: 18 },
+            blockExplorerUrls: p.explorer ? [p.explorer] : [],
+          },
+        ],
+      });
+      // Try switch again
+      await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainIdHex }] });
+    } else {
+      throw e;
+    }
   }
 }
 
@@ -221,7 +257,7 @@ export default function App() {
     if (!account || account === "0x0000000000000000000000000000000000000000") {
       return alert("Connect MetaMask first");
     }
-    await ensureChain(env.l1Id);
+    await ensureChain(env.l1Id, env.l1Url);
     setStatus("Checking/creating your L1 PatientRecord…");
 
     const factory = getContract({ address: env.factory, abi: factoryAbi, client: l1Public });
@@ -230,15 +266,16 @@ export default function App() {
     if (rec === "0x0000000000000000000000000000000000000000") {
       const w = walletL1();
       const [from] = await w.getAddresses();
-      const txHash = await w.writeContract({
+      const { request } = await l1Public.simulateContract({
         address: env.factory,
         abi: factoryAbi,
         functionName: "createRecord",
         account: from,
-        chain: undefined,
       });
+      const txHash = await w.writeContract(request);
+      setStatus("Tx sent to create record — waiting for confirmation…");
       setLastTx(txHash as string);
-      await l1Public.waitForTransactionReceipt({ hash: txHash });
+      await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       rec = (await factory.read.recordOf([account])) as Hex;
     }
     setRecord(rec);
@@ -255,9 +292,10 @@ export default function App() {
       if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
         return alert("Ensure your record first");
       }
-      await ensureChain(env.l1Id);
-      setStatus("Computing canonical hash & anchoring on L1…");
+      setStatus("Switching to L1…");
+      await ensureChain(env.l1Id, env.l1Url);
 
+      setStatus("Computing canonical hash…");
       const canonical = canonicalBytesFromJson(jsonText);
       const digest = await sha256Bytes(canonical);
       const hex = toHex(digest);
@@ -265,19 +303,27 @@ export default function App() {
 
       const w = walletL1();
       const [from] = await w.getAddresses();
-      const txHash = await w.writeContract({
+
+      // Preflight to surface ABI/arg errors immediately
+      setStatus("Preflighting anchor call…");
+      const { request } = await l1Public.simulateContract({
         address: recordAddr,
         abi: patientRecordAbi,
         functionName: "anchor",
         args: [hex as Hex, BigInt(env.l2Id)],
         account: from,
-        chain: undefined,
       });
+
+      setStatus("Requesting wallet confirmation…");
+      const txHash = await w.writeContract(request);
       setLastTx(txHash as string);
-      await l1Public.waitForTransactionReceipt({ hash: txHash });
+
+      setStatus("Tx sent — waiting for 1 confirmation…");
+      await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       setStatus("✅ Anchored on L1.");
     } catch (e: any) {
-      setStatus("❌ L1 anchor failed: " + (e?.message || String(e)));
+      console.error("anchor error", e);
+      setStatus("❌ L1 anchor failed: " + (e?.shortMessage || e?.message || String(e)));
     }
   }
 
@@ -285,7 +331,8 @@ export default function App() {
     try {
       if (!account || account === "0x0000000000000000000000000000000000000000") return alert("Connect MetaMask first");
       if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") return alert("Ensure your record first");
-      await ensureChain(env.l2Id);
+      setStatus("Switching to L2…");
+      await ensureChain(env.l2Id, env.l2Url);
       setStatus("Encrypting and storing ciphertext on L2…");
 
       // Canonicalize & hash (for deterministic derivation)
@@ -298,20 +345,25 @@ export default function App() {
 
       const w = walletL2();
       const [from] = await w.getAddresses();
-      const txHash = await w.writeContract({
+
+      // Preflight
+      const { request } = await l2Public.simulateContract({
         address: env.vault,
         abi: vaultWriteAbi,
         functionName: "put",
         args: [tagHex as Hex, ctHex as Hex],
         account: from,
-        chain: undefined,
       });
+
+      const txHash = await w.writeContract(request);
       setLastTx(txHash as string);
-      await l2Public.waitForTransactionReceipt({ hash: txHash });
+      setStatus("Tx sent — waiting for L2 confirmation…");
+      await l2Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       setL2Tag(tagHex);
       setStatus("✅ Stored on L2 (ciphertext vault)");
     } catch (e: any) {
-      setStatus("❌ L2 store failed: " + (e?.message || String(e)));
+      console.error("l2 store error", e);
+      setStatus("❌ L2 store failed: " + (e?.shortMessage || e?.message || String(e)));
     }
   }
 
@@ -352,7 +404,8 @@ export default function App() {
       const okCount = out.filter((r) => r.ok).length;
       setStatus(`✅ Restore complete (${okCount}/${out.length} verified)`);
     } catch (e: any) {
-      setStatus("❌ Restore failed: " + (e?.message || String(e)));
+      console.error("restore error", e);
+      setStatus("❌ Restore failed: " + (e?.shortMessage || e?.message || String(e)));
     }
   }
 
