@@ -13,6 +13,16 @@ import type { Hex } from "viem";
 import stringify from "json-stable-stringify";
 import { hash as sha256Bytes } from "./lib/sdk/crypto/hash"; // local helper (Uint8Array sha256)
 
+// ------- Types -------
+type RestoreRow = {
+  i: number;
+  ok: boolean;
+  tag: string;
+  ch: string;
+  preview?: string;
+  missing?: boolean;
+};
+
 // --- ENV from Vite (set these in Vercel/local .env) ---
 const env = {
   l1Id: Number(import.meta.env.VITE_L1_CHAIN_ID), // e.g. 11155111 (Sepolia)
@@ -68,7 +78,8 @@ const patientRecordAbi = [
     type: "function",
     name: "anchor",
     stateMutability: "nonpayable",
-    inputs: [{ type: "bytes32" }, { type: "uint256" }],
+    // IMPORTANT: uint32 (not uint256)
+    inputs: [{ type: "bytes32" }, { type: "uint32" }],
     outputs: [],
   },
 ] as const;
@@ -163,12 +174,7 @@ async function deriveTagKeyNonce(
   recordAddr: Hex,
   contentHash: Uint8Array
 ): Promise<{ tagHex: Hex; keyBytes: Uint8Array; nonce: Uint8Array }> {
-  const base = concatBytes(
-    enc.encode("PC-DERIVE"),
-    hexToBytes(account),
-    hexToBytes(recordAddr),
-    contentHash
-  );
+  const base = concatBytes(enc.encode("PC-DERIVE"), hexToBytes(account), hexToBytes(recordAddr), contentHash);
   const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16); // 16 bytes
   const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base)); // 32 bytes
   const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12); // 12 bytes
@@ -216,7 +222,13 @@ async function fetchCiphertextByTag(tagHex: Hex): Promise<Hex | null> {
   } catch {}
   // 3) Logs: event Stored(tag, ciphertext)
   try {
-    const logs = await l2Public.getLogs({ address: env.vault, event: StoredEvent, args: { tag: tagHex }, fromBlock: 0n, toBlock: "latest" });
+    const logs = await l2Public.getLogs({
+      address: env.vault,
+      event: StoredEvent,
+      args: { tag: tagHex },
+      fromBlock: 0n,
+      toBlock: "latest",
+    });
     if (logs.length) {
       const last = logs[logs.length - 1] as any;
       const ct: Hex | undefined = last?.args?.ciphertext;
@@ -241,9 +253,7 @@ export default function App() {
 
   // Restore state
   const [seed, setSeed] = useState<string>("");
-  const [restoreResults, setRestoreResults] = useState<
-    { i: number; ok: boolean; tag: string; ch: string; preview?: string; missing?: boolean }[]
-  >([]);
+  const [restoreResults, setRestoreResults] = useState<RestoreRow[]>([]);
 
   async function connect() {
     const eth = (window as any).ethereum;
@@ -312,7 +322,7 @@ export default function App() {
         address: recordAddr,
         abi: patientRecordAbi,
         functionName: "anchor",
-        args: [hex as Hex, BigInt(env.l2Id)],
+        args: [hex as Hex, env.l2Id], // uint32 -> number
         account: from,
       });
 
@@ -382,7 +392,7 @@ export default function App() {
       // Read timeline from L1
       const rec = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
       const seq = Number(await rec.read.seq());
-      const out: { i: number; ok: boolean; tag: string; ch: string; preview?: string; missing?: boolean }[] = [];
+      const out: RestoreRow[] = [];
 
       for (let i = 0; i < seq; i++) {
         const chHex = (await rec.read.contentHashAt([BigInt(i)])) as Hex;
@@ -397,11 +407,12 @@ export default function App() {
         }
         const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex as Hex));
         const check = await sha256Bytes(pt);
-        const ok = toHex(check) === (chHex as string).toLowerCase();
+        const ok = toHex(check).toLowerCase() === (chHex as string).toLowerCase();
         let preview: string | undefined = undefined;
         try {
           const j = JSON.parse(dec.decode(pt));
-          preview = JSON.stringify(j).slice(0, 140) + (JSON.stringify(j).length > 140 ? "…" : "");
+          const s = JSON.stringify(j);
+          preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
         } catch {}
         out.push({ i, ok, tag: tagHex, ch: chHex, preview });
       }
@@ -463,7 +474,9 @@ export default function App() {
       <hr style={{ margin: "24px 0" }} />
 
       <h3>Restore from seed</h3>
-      <p style={{ opacity: 0.8, marginTop: -6 }}>Seed never leaves your device. We derive tags/keys per-entry and verify against L1 hashes.</p>
+      <p style={{ opacity: 0.8, marginTop: -6 }}>
+        Seed never leaves your device. We derive tags/keys per-entry and verify against L1 hashes.
+      </p>
       <textarea
         rows={3}
         style={{ width: "100%" }}
@@ -479,7 +492,7 @@ export default function App() {
         <div style={{ marginTop: 12 }}>
           <b>Restored entries:</b>
           <ul>
-            {restoreResults.map((r) => (
+            {restoreResults.map((r: RestoreRow) => (
               <li key={r.i} style={{ margin: "6px 0" }}>
                 #{r.i} — tag {r.tag} — {r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch"}
                 {r.preview && (
@@ -494,24 +507,28 @@ export default function App() {
       <p style={{ marginTop: 8 }}>{status}</p>
 
       {/* Quick Actions panel to avoid hunting for buttons */}
-      <div id="quick-actions" style={{
-        marginTop: 8,
-        padding: 12,
-        borderRadius: 12,
-        border: '1px solid rgba(0,0,0,0.1)',
-        background: 'linear-gradient(180deg, rgba(0,0,0,0.03), rgba(0,0,0,0.01))'
-      }}>
+      <div
+        id="quick-actions"
+        style={{
+          marginTop: 8,
+          padding: 12,
+          borderRadius: 12,
+          border: "1px solid rgba(0,0,0,0.1)",
+          background: "linear-gradient(180deg, rgba(0,0,0,0.03), rgba(0,0,0,0.01))",
+        }}
+      >
         <b>Quick actions</b>
         <div style={{ marginTop: 8 }}>
           <button onClick={encryptAndStoreL2}>
-            {didStore ? 'Re-encrypt & Store to L2' : 'Encrypt & Store to L2 (Next)'}
-          </button>{' '}
+            {didStore ? "Re-encrypt & Store to L2" : "Encrypt & Store to L2 (Next)"}
+          </button>{" "}
           <button onClick={hashAndAnchorL1}>
-            {didAnchor ? 'Re-anchor on L1' : 'Generate Hash & Anchor to L1'}
+            {didAnchor ? "Re-anchor on L1" : "Generate Hash & Anchor to L1"}
           </button>
         </div>
         <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-          Order tip: You can store on L2 first and anchor after, or anchor first and store next — hashes verify either way.
+          Order tip: You can store on L2 first and anchor after, or anchor first and store next — hashes verify either
+          way.
         </div>
       </div>
       <p style={{ opacity: 0.7, fontSize: 13, marginTop: 12 }}>
