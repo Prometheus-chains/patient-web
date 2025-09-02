@@ -230,6 +230,8 @@ export default function App() {
   const [account, setAccount] = useState<Hex>("0x0000000000000000000000000000000000000000");
   const [recordAddr, setRecord] = useState<Hex>("0x0000000000000000000000000000000000000000");
   const [status, setStatus] = useState<string>("");
+  const [didAnchor, setDidAnchor] = useState<boolean>(false);
+  const [didStore, setDidStore] = useState<boolean>(false);
   const [jsonText, setJson] = useState<string>(
     '{"resourceType":"Bundle","type":"collection","entry":[{"resource":{"resourceType":"Patient","id":"me"}}]}'
   );
@@ -320,7 +322,9 @@ export default function App() {
 
       setStatus("Tx sent — waiting for 1 confirmation…");
       await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-      setStatus("✅ Anchored on L1.");
+      setDidAnchor(true);
+      setStatus("✅ Anchored on L1. You can now Encrypt & Store on L2.");
+      document.getElementById("quick-actions")?.scrollIntoView({ behavior: "smooth", block: "center" });
     } catch (e: any) {
       console.error("anchor error", e);
       setStatus("❌ L1 anchor failed: " + (e?.shortMessage || e?.message || String(e)));
@@ -360,7 +364,9 @@ export default function App() {
       setStatus("Tx sent — waiting for L2 confirmation…");
       await l2Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       setL2Tag(tagHex);
-      setStatus("✅ Stored on L2 (ciphertext vault)");
+      setDidStore(true);
+      setStatus("✅ Stored on L2 (ciphertext vault). Optional: re-run Anchor to link this snapshot explicitly.");
+      document.getElementById("quick-actions")?.scrollIntoView({ behavior: "smooth", block: "center" });
     } catch (e: any) {
       console.error("l2 store error", e);
       setStatus("❌ L2 store failed: " + (e?.shortMessage || e?.message || String(e)));
@@ -486,6 +492,28 @@ export default function App() {
       )}
 
       <p style={{ marginTop: 8 }}>{status}</p>
+
+      {/* Quick Actions panel to avoid hunting for buttons */}
+      <div id="quick-actions" style={{
+        marginTop: 8,
+        padding: 12,
+        borderRadius: 12,
+        border: '1px solid rgba(0,0,0,0.1)',
+        background: 'linear-gradient(180deg, rgba(0,0,0,0.03), rgba(0,0,0,0.01))'
+      }}>
+        <b>Quick actions</b>
+        <div style={{ marginTop: 8 }}>
+          <button onClick={encryptAndStoreL2}>
+            {didStore ? 'Re-encrypt & Store to L2' : 'Encrypt & Store to L2 (Next)'}
+          </button>{' '}
+          <button onClick={hashAndAnchorL1}>
+            {didAnchor ? 'Re-anchor on L1' : 'Generate Hash & Anchor to L1'}
+          </button>
+        </div>
+        <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
+          Order tip: You can store on L2 first and anchor after, or anchor first and store next — hashes verify either way.
+        </div>
+      </div>
       <p style={{ opacity: 0.7, fontSize: 13, marginTop: 12 }}>
         Tip: If your deployed vault uses <code>bytes32</code> tags, update the ABI types (and derivation slice) accordingly.
       </p>
