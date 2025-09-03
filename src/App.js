@@ -1,6 +1,6 @@
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
 import { useState } from "react";
-import { createPublicClient, createWalletClient, getContract, custom, http, toHex, hexToBytes, parseAbiItem, } from "viem";
+import { createPublicClient, createWalletClient, getContract, custom, http, toHex, hexToBytes, } from "viem";
 import stringify from "json-stable-stringify";
 import { hash as sha256Bytes } from "./lib/sdk/crypto/hash"; // local helper (Uint8Array sha256)
 // --- ENV from Vite (set these in Vercel/local .env) ---
@@ -10,8 +10,10 @@ const env = {
     l2Id: Number(import.meta.env.VITE_L2_CHAIN_ID), // e.g. 84532 (Base Sepolia)
     l2Url: import.meta.env.VITE_L2_RPC_URL,
     factory: import.meta.env.VITE_FACTORY_ADDRESS,
-    vault: import.meta.env.VITE_VAULT_ADDRESS,
+    vault: import.meta.env.VAULT_ADDRESS, // fallback below
 };
+// Back-compat for env var name
+env.vault = env.vault ?? import.meta.env.VITE_VAULT_ADDRESS;
 // Known presets to help add chains if missing in MetaMask.
 const PRESETS = {
     11155111: {
@@ -79,8 +81,6 @@ const vaultReadAbi = [
     { type: "function", name: "get", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes" }] },
     { type: "function", name: "blobs", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes" }] },
 ];
-// Event for log-based recovery (if contract emits ciphertext)
-const StoredEvent = parseAbiItem("event Stored(bytes16 tag, bytes ciphertext)");
 // --- VIEM public + wallet clients ---
 const l1Public = createPublicClient({ chain: { id: env.l1Id }, transport: http(env.l1Url) });
 const l2Public = createPublicClient({ chain: { id: env.l2Id }, transport: http(env.l2Url) });
@@ -156,21 +156,53 @@ function downloadBytes(bytes, filename, mime = "application/octet-stream") {
 function shortAddr(a) {
     return `${a.slice(0, 6)}…${a.slice(-4)}`;
 }
-// Derivation used for L2 store (account-bound) — retained for backward compatibility
-async function deriveTagKeyNonce(account, recordAddr, contentHash) {
+// -------- Wallet-bound secret derivation (OFF-CHAIN signature) --------
+// 1) Derive a stable per-record root from an EIP-712 signature.
+//    This never touches the chain; it’s created locally and can be re-created anytime.
+async function deriveRootViaSignature(recordAddr) {
+    const w = walletL1();
+    const [from] = await w.getAddresses();
+    // Domain separation ensures the message is unique to this app, chain, and record.
+    const sig = await w.signTypedData({
+        account: from,
+        domain: {
+            name: "PrometheusChains",
+            version: "1",
+            chainId: env.l1Id,
+            verifyingContract: recordAddr,
+        },
+        types: {
+            Derive: [
+                { name: "purpose", type: "string" },
+                { name: "record", type: "address" },
+                { name: "l2", type: "uint256" },
+            ],
+        },
+        primaryType: "Derive",
+        message: {
+            purpose: "pc-key-derivation-v1",
+            record: recordAddr,
+            l2: BigInt(env.l2Id),
+        },
+    });
+    // Hash the signature bytes to get a 32-byte root
+    return await sha256Bytes(hexToBytes(sig));
+}
+// 2) Use the root for per-entry derivation (tag/key/nonce).
+async function deriveTagKeyNonceFromRoot(root, recordAddr, contentHash) {
+    const base = concatBytes(enc.encode("PC-DERIVE-ROOT"), root, hexToBytes(recordAddr), contentHash);
+    const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
+    const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base));
+    const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12);
+    return { tagHex: toHex(tag), keyBytes: key, nonce };
+}
+// 3) LEGACY (public-only) derivation retained for back-compat restore.
+//    NOTE: This is insecure for confidentiality and used only to recover old entries you already wrote.
+async function deriveTagKeyNonce_Legacy(account, recordAddr, contentHash) {
     const base = concatBytes(enc.encode("PC-DERIVE"), hexToBytes(account), hexToBytes(recordAddr), contentHash);
     const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16); // 16 bytes
     const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base)); // 32 bytes
     const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12); // 12 bytes
-    return { tagHex: toHex(tag), keyBytes: key, nonce };
-}
-// Seed-based derivation for restore (mnemonic/passphrase never leaves device)
-async function deriveTagKeyNonceFromSeed(seed, recordAddr, contentHash) {
-    const seedRoot = await sha256Bytes(enc.encode(seed.trim())); // simple root; swap for HKDF/BIP39 if desired
-    const base = concatBytes(enc.encode("PC-DERIVE-SEED"), seedRoot, hexToBytes(recordAddr), contentHash);
-    const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
-    const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base));
-    const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12);
     return { tagHex: toHex(tag), keyBytes: key, nonce };
 }
 async function aesGcmEncrypt(keyBytes, nonce, plaintext) {
@@ -183,7 +215,7 @@ async function aesGcmDecrypt(keyBytes, nonce, ciphertext) {
     const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ciphertext);
     return new Uint8Array(pt);
 }
-// Try multiple read paths to fetch ciphertext by tag from the L2 vault
+// Try read paths to fetch ciphertext by tag from the L2 vault (NO LOG SCAN to avoid tag leakage)
 async function fetchCiphertextByTag(tagHex) {
     const vaultRead = getContract({ address: env.vault, abi: vaultReadAbi, client: l2Public });
     // 1) Direct getter `get(tag)`
@@ -200,23 +232,6 @@ async function fetchCiphertextByTag(tagHex) {
             return res2;
     }
     catch { }
-    // 3) Logs: event Stored(tag, ciphertext)
-    try {
-        const logs = await l2Public.getLogs({
-            address: env.vault,
-            event: StoredEvent,
-            args: { tag: tagHex },
-            fromBlock: 0n,
-            toBlock: "latest",
-        });
-        if (logs.length) {
-            const last = logs[logs.length - 1];
-            const ct = last?.args?.ciphertext;
-            if (ct && ct !== "0x")
-                return ct;
-        }
-    }
-    catch { }
     return null;
 }
 export default function App() {
@@ -229,8 +244,9 @@ export default function App() {
     const [hashHex, setHashHex] = useState("");
     const [l2Tag, setL2Tag] = useState("");
     const [lastTx, setLastTx] = useState("");
+    // Wallet-bound root (in-memory only)
+    const [root, setRoot] = useState(null);
     // Restore state
-    const [seed, setSeed] = useState("");
     const [restoreResults, setRestoreResults] = useState([]);
     async function connect() {
         const eth = window.ethereum;
@@ -270,6 +286,21 @@ export default function App() {
     function canonicalBytesFromJson(text) {
         const obj = JSON.parse(text);
         return enc.encode(stringify(obj, { space: 0 }));
+    }
+    async function authorizeKeyDerivation() {
+        try {
+            if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
+                return alert("Ensure your record first");
+            }
+            setStatus("Requesting wallet signature for key derivation…");
+            const r = await deriveRootViaSignature(recordAddr);
+            setRoot(r);
+            setStatus("🔑 Key derivation authorized for this session.");
+        }
+        catch (e) {
+            console.error("sign error", e);
+            setStatus("❌ Signature failed: " + (e?.shortMessage || e?.message || String(e)));
+        }
     }
     async function hashAndAnchorL1() {
         try {
@@ -314,13 +345,16 @@ export default function App() {
                 return alert("Connect MetaMask first");
             if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000")
                 return alert("Ensure your record first");
+            if (!root)
+                return alert("Click “Authorize key derivation (sign)” first.");
             setStatus("Switching to L2…");
             await ensureChain(env.l2Id, env.l2Url);
             setStatus("Encrypting and storing ciphertext on L2…");
             // Canonicalize & hash (for deterministic derivation)
             const canonical = canonicalBytesFromJson(jsonText);
             const digest = await sha256Bytes(canonical); // 32 bytes
-            const { tagHex, keyBytes, nonce } = await deriveTagKeyNonce(account, recordAddr, digest);
+            // NEW: secret, wallet-bound derivation
+            const { tagHex, keyBytes, nonce } = await deriveTagKeyNonceFromRoot(root, recordAddr, digest);
             const ciphertext = await aesGcmEncrypt(keyBytes, nonce, canonical);
             const ctHex = toHex(ciphertext);
             const w = walletL2();
@@ -347,44 +381,72 @@ export default function App() {
             setStatus("❌ L2 store failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
-    async function restoreFromSeed() {
+    async function restoreFromWallet() {
         try {
-            if (!seed.trim())
-                return alert("Enter your restore seed (mnemonic/passphrase)");
             if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000")
                 return alert("Ensure your record first");
-            setStatus("Restoring from seed…");
+            if (!root)
+                return alert("Click “Authorize key derivation (sign)” first.");
+            setStatus("Restoring with wallet-bound derivation…");
             // Read timeline from L1
             const rec = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
             const seq = Number(await rec.read.seq());
+            // Auto-detect 1-indexed vs 0-indexed
+            const indices = [];
+            try {
+                await rec.read.contentHashAt([1n]); // succeeds if 1-indexed
+                for (let i = 1; i <= seq; i++)
+                    indices.push(i);
+            }
+            catch {
+                for (let i = 0; i < seq; i++)
+                    indices.push(i);
+            }
             const out = [];
-            // FIX: PatientRecord is 1-indexed
-            for (let i = 1; i <= seq; i++) {
+            for (const i of indices) {
                 const chHex = (await rec.read.contentHashAt([BigInt(i)]));
                 const chBytes = hexToBytes(chHex);
-                // Derive tag/key/nonce from seed + record + contentHash
-                const { tagHex, keyBytes, nonce } = await deriveTagKeyNonceFromSeed(seed, recordAddr, chBytes);
-                // Fetch ciphertext by tag from L2 (read / logs)
-                const ctHex = await fetchCiphertextByTag(tagHex);
-                if (!ctHex) {
-                    out.push({ i, ok: false, tag: tagHex, ch: chHex, missing: true });
+                // Preferred: root derivation (secret)
+                const rootDer = await deriveTagKeyNonceFromRoot(root, recordAddr, chBytes);
+                let tagTried = rootDer.tagHex;
+                let ctHex = await fetchCiphertextByTag(tagTried);
+                let mode = undefined;
+                let pt = null;
+                if (ctHex && ctHex !== "0x") {
+                    try {
+                        pt = await aesGcmDecrypt(rootDer.keyBytes, rootDer.nonce, hexToBytes(ctHex));
+                        mode = "root";
+                    }
+                    catch { }
+                }
+                // Legacy fallback (old entries created with public-only derivation)
+                if (!pt) {
+                    const legacyDer = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes);
+                    tagTried = legacyDer.tagHex;
+                    ctHex = await fetchCiphertextByTag(tagTried);
+                    if (ctHex && ctHex !== "0x") {
+                        try {
+                            pt = await aesGcmDecrypt(legacyDer.keyBytes, legacyDer.nonce, hexToBytes(ctHex));
+                            mode = "legacy";
+                        }
+                        catch { }
+                    }
+                }
+                if (!pt) {
+                    out.push({ i, ok: false, tag: tagTried, ch: chHex, missing: true });
                     continue;
                 }
-                let ok = false;
+                // Verify against L1 contentHash
+                const check = await sha256Bytes(pt);
+                const ok = toHex(check).toLowerCase() === chHex.toLowerCase();
                 let preview = undefined;
                 try {
-                    const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex));
-                    const check = await sha256Bytes(pt);
-                    ok = toHex(check).toLowerCase() === chHex.toLowerCase();
-                    // lightweight preview
                     const j = JSON.parse(dec.decode(pt));
                     const s = JSON.stringify(j);
                     preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
                 }
-                catch {
-                    ok = false;
-                }
-                out.push({ i, ok, tag: tagHex, ch: chHex, preview });
+                catch { }
+                out.push({ i, ok, tag: tagTried, ch: chHex, preview, mode });
             }
             setRestoreResults(out);
             const okCount = out.filter((r) => r.ok).length;
@@ -410,9 +472,16 @@ export default function App() {
     }
     async function onDownloadDecrypted(r) {
         try {
-            if (!seed.trim())
-                return alert("Enter your restore seed first.");
-            const { keyBytes, nonce } = await deriveTagKeyNonceFromSeed(seed, recordAddr, hexToBytes(r.ch));
+            let keyBytes, nonce;
+            const chBytes = hexToBytes(r.ch);
+            if (r.mode === "legacy") {
+                ({ keyBytes, nonce } = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes));
+            }
+            else {
+                if (!root)
+                    return alert("Click “Authorize key derivation (sign)” first.");
+                ({ keyBytes, nonce } = await deriveTagKeyNonceFromRoot(root, recordAddr, chBytes));
+            }
             const ctHex = await fetchCiphertextByTag(r.tag);
             if (!ctHex)
                 return alert("Ciphertext not found in vault for this tag.");
@@ -429,11 +498,11 @@ export default function App() {
             alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
-    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] })] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] })), l2Tag && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] })), lastTx && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] })), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore from seed" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "Seed never leaves your device. We derive tags/keys per-entry and verify against L1 hashes." }), _jsx("textarea", { rows: 3, style: { width: "100%" }, placeholder: "Enter your seed (mnemonic or passphrase)", value: seed, onChange: (e) => setSeed(e.target.value) }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromSeed, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
+    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" }), " ", _jsx("button", { onClick: authorizeKeyDerivation, disabled: !recordAddr || recordAddr.endsWith("0000"), children: "Authorize key derivation (sign)" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] }), root ? _jsx("div", { style: { color: "#0a0" }, children: "\uD83D\uDD11 Key derivation active (session)" }) : null] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] })), l2Tag && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] })), lastTx && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] })), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore" }), _jsxs("p", { style: { opacity: 0.8, marginTop: -6 }, children: ["We derive tags/keys per-entry from a wallet signature ", _jsx("i", { children: "kept off-chain" }), " and verify against L1 hashes."] }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromWallet, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.mode === "legacy" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (legacy entry)" })) : r.mode === "root" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet-derived)" })) : null, r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
                     marginTop: 8,
                     padding: 12,
                     borderRadius: 12,
                     border: "1px solid rgba(0,0,0,0.1)",
                     background: "linear-gradient(180deg, rgba(0,0,0,0.03), rgba(0,0,0,0.01))",
-                }, children: [_jsx("b", { children: "Quick actions" }), _jsxs("div", { style: { marginTop: 8 }, children: [_jsx("button", { onClick: encryptAndStoreL2, children: didStore ? "Re-encrypt & Store to L2" : "Encrypt & Store to L2 (Next)" }), " ", _jsx("button", { onClick: hashAndAnchorL1, children: didAnchor ? "Re-anchor on L1" : "Generate Hash & Anchor to L1" })] }), _jsx("div", { style: { fontSize: 12, opacity: 0.75, marginTop: 6 }, children: "Order tip: You can store on L2 first and anchor after, or anchor first and store next \u2014 hashes verify either way." })] }), _jsxs("p", { style: { opacity: 0.7, fontSize: 13, marginTop: 12 }, children: ["Tip: If your deployed vault uses ", _jsx("code", { children: "bytes32" }), " tags, update the ABI types (and derivation slice) accordingly."] })] }));
+                }, children: [_jsx("b", { children: "Quick actions" }), _jsxs("div", { style: { marginTop: 8 }, children: [_jsx("button", { onClick: encryptAndStoreL2, children: didStore ? "Re-encrypt & Store to L2" : "Encrypt & Store to L2 (Next)" }), " ", _jsx("button", { onClick: hashAndAnchorL1, children: didAnchor ? "Re-anchor on L1" : "Generate Hash & Anchor to L1" })] }), _jsx("div", { style: { fontSize: 12, opacity: 0.75, marginTop: 6 }, children: "Order tip: You can store on L2 first and anchor after, or anchor first and store next \u2014 hashes verify either way." })] }), _jsxs("p", { style: { opacity: 0.7, fontSize: 13, marginTop: 12 }, children: ["Tip: If your deployed vault uses ", _jsx("code", { children: "bytes32" }), " tags, update the ABI types (and derivation slice) accordingly. Also, ensure your vault does ", _jsx("b", { children: "not emit" }), " events with tags/ciphertexts to avoid public tag harvesting."] })] }));
 }
