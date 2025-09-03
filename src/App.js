@@ -143,6 +143,19 @@ function concatBytes(...arrs) {
         out.set(a, off), (off += a.length);
     return out;
 }
+// Small helpers for download + filenames
+function downloadBytes(bytes, filename, mime = "application/octet-stream") {
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+function shortAddr(a) {
+    return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
 // Derivation used for L2 store (account-bound) — retained for backward compatibility
 async function deriveTagKeyNonce(account, recordAddr, contentHash) {
     const base = concatBytes(enc.encode("PC-DERIVE"), hexToBytes(account), hexToBytes(recordAddr), contentHash);
@@ -345,7 +358,8 @@ export default function App() {
             const rec = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
             const seq = Number(await rec.read.seq());
             const out = [];
-            for (let i = 0; i < seq; i++) {
+            // FIX: PatientRecord is 1-indexed
+            for (let i = 1; i <= seq; i++) {
                 const chHex = (await rec.read.contentHashAt([BigInt(i)]));
                 const chBytes = hexToBytes(chHex);
                 // Derive tag/key/nonce from seed + record + contentHash
@@ -356,16 +370,20 @@ export default function App() {
                     out.push({ i, ok: false, tag: tagHex, ch: chHex, missing: true });
                     continue;
                 }
-                const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex));
-                const check = await sha256Bytes(pt);
-                const ok = toHex(check).toLowerCase() === chHex.toLowerCase();
+                let ok = false;
                 let preview = undefined;
                 try {
+                    const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex));
+                    const check = await sha256Bytes(pt);
+                    ok = toHex(check).toLowerCase() === chHex.toLowerCase();
+                    // lightweight preview
                     const j = JSON.parse(dec.decode(pt));
                     const s = JSON.stringify(j);
                     preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
                 }
-                catch { }
+                catch {
+                    ok = false;
+                }
                 out.push({ i, ok, tag: tagHex, ch: chHex, preview });
             }
             setRestoreResults(out);
@@ -377,7 +395,41 @@ export default function App() {
             setStatus("❌ Restore failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
-    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] })] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] })), l2Tag && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] })), lastTx && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] })), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore from seed" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "Seed never leaves your device. We derive tags/keys per-entry and verify against L1 hashes." }), _jsx("textarea", { rows: 3, style: { width: "100%" }, placeholder: "Enter your seed (mnemonic or passphrase)", value: seed, onChange: (e) => setSeed(e.target.value) }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromSeed, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] }))] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
+    // --- Per-entry downloads ---
+    async function onDownloadCipher(r) {
+        try {
+            const ctHex = await fetchCiphertextByTag(r.tag);
+            if (!ctHex)
+                return alert("Ciphertext not found in vault for this tag.");
+            const fn = `record-${shortAddr(String(recordAddr))}-#${r.i}-${r.ch.slice(2, 10)}.cipher.bin`;
+            downloadBytes(hexToBytes(ctHex), fn);
+        }
+        catch (e) {
+            alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
+        }
+    }
+    async function onDownloadDecrypted(r) {
+        try {
+            if (!seed.trim())
+                return alert("Enter your restore seed first.");
+            const { keyBytes, nonce } = await deriveTagKeyNonceFromSeed(seed, recordAddr, hexToBytes(r.ch));
+            const ctHex = await fetchCiphertextByTag(r.tag);
+            if (!ctHex)
+                return alert("Ciphertext not found in vault for this tag.");
+            const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex));
+            // verify against L1 contentHash
+            const digest = await sha256Bytes(pt);
+            const ok = toHex(digest).toLowerCase() === r.ch.toLowerCase();
+            if (!ok)
+                return alert("Hash mismatch — refusing to export plaintext.");
+            const fn = `record-${shortAddr(String(recordAddr))}-#${r.i}-${r.ch.slice(2, 10)}.fhir.json`;
+            downloadBytes(pt, fn, "application/fhir+json");
+        }
+        catch (e) {
+            alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
+        }
+    }
+    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] })] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] })), l2Tag && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] })), lastTx && (_jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] })), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore from seed" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "Seed never leaves your device. We derive tags/keys per-entry and verify against L1 hashes." }), _jsx("textarea", { rows: 3, style: { width: "100%" }, placeholder: "Enter your seed (mnemonic or passphrase)", value: seed, onChange: (e) => setSeed(e.target.value) }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromSeed, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
                     marginTop: 8,
                     padding: 12,
                     borderRadius: 12,
