@@ -10,10 +10,8 @@ const env = {
     l2Id: Number(import.meta.env.VITE_L2_CHAIN_ID), // e.g. 84532 (Base Sepolia)
     l2Url: import.meta.env.VITE_L2_RPC_URL,
     factory: import.meta.env.VITE_FACTORY_ADDRESS,
-    vault: import.meta.env.VAULT_ADDRESS, // fallback below
+    vault: import.meta.env.VAULT_ADDRESS ?? import.meta.env.VITE_VAULT_ADDRESS,
 };
-// Back-compat for env var name
-env.vault = env.vault ?? import.meta.env.VITE_VAULT_ADDRESS;
 // Known presets to help add chains if missing in MetaMask.
 const PRESETS = {
     11155111: {
@@ -62,24 +60,25 @@ const patientRecordAbi = [
         outputs: [],
     },
 ];
-// EventVault (hash-addressed ciphertext storage)
-// NOTE: Adjust `bytes16` to `bytes32` if your deployed vault expects 32-byte tags.
+// -------- Correct Vault ABIs (per your spec) --------
+// Write: put(ciphertext, tag) -> returns envelopeId (bytes32)
 const vaultWriteAbi = [
     {
         type: "function",
         name: "put",
         stateMutability: "nonpayable",
         inputs: [
-            { name: "tag", type: "bytes16" },
-            { name: "ciphertext", type: "bytes" },
+            { name: "ciphertext", type: "bytes" }, // FIRST
+            { name: "tag", type: "bytes16" } // SECOND
         ],
-        outputs: [],
+        outputs: [{ type: "bytes32" }], // envelopeId
     },
 ];
-// Optional read shapes (support both variants if present on your deployed contract)
+// Reads exposed by your vault
 const vaultReadAbi = [
-    { type: "function", name: "get", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes" }] },
-    { type: "function", name: "blobs", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes" }] },
+    { type: "function", name: "getCiphertextByTag", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes" }] },
+    { type: "function", name: "getEnvelopeIdByTag", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes32" }] },
+    { type: "function", name: "getCiphertext", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "bytes" }] },
 ];
 // --- VIEM public + wallet clients ---
 const l1Public = createPublicClient({ chain: { id: env.l1Id }, transport: http(env.l1Url) });
@@ -157,12 +156,10 @@ function shortAddr(a) {
     return `${a.slice(0, 6)}…${a.slice(-4)}`;
 }
 // -------- Wallet-bound secret derivation (OFF-CHAIN signature) --------
-// 1) Derive a stable per-record root from an EIP-712 signature.
-//    This never touches the chain; it’s created locally and can be re-created anytime.
+// 1) Derive a stable per-record root from an EIP-712 signature (never on-chain).
 async function deriveRootViaSignature(recordAddr) {
     const w = walletL1();
     const [from] = await w.getAddresses();
-    // Domain separation ensures the message is unique to this app, chain, and record.
     const sig = await w.signTypedData({
         account: from,
         domain: {
@@ -197,7 +194,6 @@ async function deriveTagKeyNonceFromRoot(root, recordAddr, contentHash) {
     return { tagHex: toHex(tag), keyBytes: key, nonce };
 }
 // 3) LEGACY (public-only) derivation retained for back-compat restore.
-//    NOTE: This is insecure for confidentiality and used only to recover old entries you already wrote.
 async function deriveTagKeyNonce_Legacy(account, recordAddr, contentHash) {
     const base = concatBytes(enc.encode("PC-DERIVE"), hexToBytes(account), hexToBytes(recordAddr), contentHash);
     const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16); // 16 bytes
@@ -215,21 +211,24 @@ async function aesGcmDecrypt(keyBytes, nonce, ciphertext) {
     const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ciphertext);
     return new Uint8Array(pt);
 }
-// Try read paths to fetch ciphertext by tag from the L2 vault (NO LOG SCAN to avoid tag leakage)
+// Read ciphertext by tag using your vault's API (no log scanning)
 async function fetchCiphertextByTag(tagHex) {
-    const vaultRead = getContract({ address: env.vault, abi: vaultReadAbi, client: l2Public });
-    // 1) Direct getter `get(tag)`
+    const vault = getContract({ address: env.vault, abi: vaultReadAbi, client: l2Public });
+    // Fast path: direct convenience getter
     try {
-        const res = (await vaultRead.read.get([tagHex]));
-        if (res && res !== "0x")
-            return res;
+        const bytesByTag = (await vault.read.getCiphertextByTag([tagHex]));
+        if (bytesByTag && bytesByTag !== "0x")
+            return bytesByTag;
     }
     catch { }
-    // 2) Public mapping `blobs(tag)`
+    // Fallback: resolve envelopeId, then fetch by id
     try {
-        const res2 = (await vaultRead.read.blobs([tagHex]));
-        if (res2 && res2 !== "0x")
-            return res2;
+        const envId = (await vault.read.getEnvelopeIdByTag([tagHex])); // bytes32
+        if (envId && envId !== "0x0000000000000000000000000000000000000000000000000000000000000000") {
+            const bytesById = (await vault.read.getCiphertext([envId]));
+            if (bytesById && bytesById !== "0x")
+                return bytesById;
+        }
     }
     catch { }
     return null;
@@ -364,7 +363,7 @@ export default function App() {
                 address: env.vault,
                 abi: vaultWriteAbi,
                 functionName: "put",
-                args: [tagHex, ctHex],
+                args: [ctHex, tagHex], // ciphertext FIRST, tag SECOND
                 account: from,
             });
             const txHash = await w.writeContract(request);
