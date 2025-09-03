@@ -60,8 +60,8 @@ const patientRecordAbi = [
         outputs: [],
     },
 ];
-// -------- Correct Vault ABIs (per your spec) --------
-// Write: put(ciphertext, tag) -> returns envelopeId (bytes32)
+// -------- Vault ABIs (per your deployed contract) --------
+// ✅ Write: put(ciphertext, tag) with NO return value
 const vaultWriteAbi = [
     {
         type: "function",
@@ -71,7 +71,7 @@ const vaultWriteAbi = [
             { name: "ciphertext", type: "bytes" }, // FIRST
             { name: "tag", type: "bytes16" } // SECOND
         ],
-        outputs: [{ type: "bytes32" }], // envelopeId
+        outputs: [], // <-- no return value on deployed contract
     },
 ];
 // Reads exposed by your vault
