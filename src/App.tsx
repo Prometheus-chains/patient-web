@@ -168,6 +168,20 @@ function concatBytes(...arrs: Uint8Array[]) {
   return out;
 }
 
+// Small helpers for download + filenames
+function downloadBytes(bytes: Uint8Array, filename: string, mime = "application/octet-stream") {
+  const blob = new Blob([bytes], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+function shortAddr(a: string) {
+  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+}
+
 // Derivation used for L2 store (account-bound) — retained for backward compatibility
 async function deriveTagKeyNonce(
   account: Hex,
@@ -394,7 +408,8 @@ export default function App() {
       const seq = Number(await rec.read.seq());
       const out: RestoreRow[] = [];
 
-      for (let i = 0; i < seq; i++) {
+      // FIX: PatientRecord is 1-indexed
+      for (let i = 1; i <= seq; i++) {
         const chHex = (await rec.read.contentHashAt([BigInt(i)])) as Hex;
         const chBytes = hexToBytes(chHex);
         // Derive tag/key/nonce from seed + record + contentHash
@@ -405,15 +420,19 @@ export default function App() {
           out.push({ i, ok: false, tag: tagHex, ch: chHex, missing: true });
           continue;
         }
-        const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex as Hex));
-        const check = await sha256Bytes(pt);
-        const ok = toHex(check).toLowerCase() === (chHex as string).toLowerCase();
+        let ok = false;
         let preview: string | undefined = undefined;
         try {
+          const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex as Hex));
+          const check = await sha256Bytes(pt);
+          ok = toHex(check).toLowerCase() === (chHex as string).toLowerCase();
+          // lightweight preview
           const j = JSON.parse(dec.decode(pt));
           const s = JSON.stringify(j);
           preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
-        } catch {}
+        } catch {
+          ok = false;
+        }
         out.push({ i, ok, tag: tagHex, ch: chHex, preview });
       }
 
@@ -423,6 +442,38 @@ export default function App() {
     } catch (e: any) {
       console.error("restore error", e);
       setStatus("❌ Restore failed: " + (e?.shortMessage || e?.message || String(e)));
+    }
+  }
+
+  // --- Per-entry downloads ---
+  async function onDownloadCipher(r: RestoreRow) {
+    try {
+      const ctHex = await fetchCiphertextByTag(r.tag as Hex);
+      if (!ctHex) return alert("Ciphertext not found in vault for this tag.");
+      const fn = `record-${shortAddr(String(recordAddr))}-#${r.i}-${(r.ch as string).slice(2, 10)}.cipher.bin`;
+      downloadBytes(hexToBytes(ctHex), fn);
+    } catch (e: any) {
+      alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
+    }
+  }
+
+  async function onDownloadDecrypted(r: RestoreRow) {
+    try {
+      if (!seed.trim()) return alert("Enter your restore seed first.");
+      const { keyBytes, nonce } = await deriveTagKeyNonceFromSeed(seed, recordAddr, hexToBytes(r.ch as Hex));
+      const ctHex = await fetchCiphertextByTag(r.tag as Hex);
+      if (!ctHex) return alert("Ciphertext not found in vault for this tag.");
+
+      const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex));
+      // verify against L1 contentHash
+      const digest = await sha256Bytes(pt);
+      const ok = toHex(digest).toLowerCase() === (r.ch as string).toLowerCase();
+      if (!ok) return alert("Hash mismatch — refusing to export plaintext.");
+
+      const fn = `record-${shortAddr(String(recordAddr))}-#${r.i}-${(r.ch as string).slice(2, 10)}.fhir.json`;
+      downloadBytes(pt, fn, "application/fhir+json");
+    } catch (e: any) {
+      alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
     }
   }
 
@@ -498,6 +549,12 @@ export default function App() {
                 {r.preview && (
                   <div style={{ fontSize: 12, opacity: 0.8, wordBreak: "break-all" }}>preview: {r.preview}</div>
                 )}
+                <div style={{ marginTop: 4 }}>
+                  <button onClick={() => onDownloadCipher(r)}>⬇ ciphertext</button>{" "}
+                  <button onClick={() => onDownloadDecrypted(r)} disabled={!r.ok}>
+                    ⬇ FHIR JSON
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
