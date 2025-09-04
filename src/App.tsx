@@ -35,16 +35,8 @@ const env = {
 
 // Known presets to help add chains if missing in MetaMask.
 const PRESETS: Record<number, { chainName: string; explorer: string; symbol: string }> = {
-  11155111: {
-    chainName: "Sepolia",
-    explorer: "https://sepolia.etherscan.io",
-    symbol: "ETH",
-  },
-  84532: {
-    chainName: "Base Sepolia",
-    explorer: "https://sepolia.basescan.org",
-    symbol: "ETH",
-  },
+  11155111: { chainName: "Sepolia",      explorer: "https://sepolia.etherscan.io", symbol: "ETH" },
+  84532:    { chainName: "Base Sepolia", explorer: "https://sepolia.basescan.org", symbol: "ETH" },
 };
 
 // --- Minimal ABIs ---
@@ -84,23 +76,7 @@ const patientRecordAbi = [
   },
 ] as const;
 
-// -------- Vault ABIs (per your deployed contract) --------
-
-// ✅ Write: put(ciphertext, tag) with NO return value
-const vaultWriteAbi = [
-  {
-    type: "function",
-    name: "put",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "ciphertext", type: "bytes" },  // FIRST
-      { name: "tag",        type: "bytes16" } // SECOND
-    ],
-    outputs: [], // <-- no return value on deployed contract
-  },
-] as const;
-
-// Reads exposed by your vault
+// -------- Vault READ ABIs (per your contract) --------
 const vaultReadAbi = [
   { type: "function", name: "getCiphertextByTag", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes" }] },
   { type: "function", name: "getEnvelopeIdByTag", stateMutability: "view", inputs: [{ type: "bytes16" }], outputs: [{ type: "bytes32" }] },
@@ -147,7 +123,6 @@ async function ensureChain(targetId: number, rpcUrl?: string) {
           },
         ],
       });
-      // Try switch again
       await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainIdHex }] });
     } else {
       throw e;
@@ -182,12 +157,9 @@ function shortAddr(a: string) {
 }
 
 // -------- Wallet-bound secret derivation (OFF-CHAIN signature) --------
-
-// 1) Derive a stable per-record root from an EIP-712 signature (never on-chain).
 async function deriveRootViaSignature(recordAddr: Hex): Promise<Uint8Array> {
   const w = walletL1();
   const [from] = await w.getAddresses();
-
   const sig = await (w as any).signTypedData({
     account: from,
     domain: {
@@ -199,57 +171,49 @@ async function deriveRootViaSignature(recordAddr: Hex): Promise<Uint8Array> {
     types: {
       Derive: [
         { name: "purpose", type: "string" },
-        { name: "record", type: "address" },
-        { name: "l2", type: "uint256" },
+        { name: "record",  type: "address" },
+        { name: "l2",      type: "uint256" },
       ],
     },
     primaryType: "Derive",
-    message: {
-      purpose: "pc-key-derivation-v1",
-      record: recordAddr,
-      l2: BigInt(env.l2Id),
-    },
+    message: { purpose: "pc-key-derivation-v1", record: recordAddr, l2: BigInt(env.l2Id) },
   });
-
-  // Hash the signature bytes to get a 32-byte root
-  return await sha256Bytes(hexToBytes(sig as Hex));
+  return await sha256Bytes(hexToBytes(sig as Hex)); // 32-byte root
 }
 
-// 2) Use the root for per-entry derivation (tag/key/nonce).
 async function deriveTagKeyNonceFromRoot(
   root: Uint8Array,
   recordAddr: Hex,
   contentHash: Uint8Array
 ): Promise<{ tagHex: Hex; keyBytes: Uint8Array; nonce: Uint8Array }> {
   const base = concatBytes(enc.encode("PC-DERIVE-ROOT"), root, hexToBytes(recordAddr), contentHash);
-  const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
-  const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base));
+  const tag   = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
+  const key   =  await sha256Bytes(concatBytes(enc.encode("KEY"), base));
   const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12);
   return { tagHex: toHex(tag) as Hex, keyBytes: key, nonce };
 }
 
-// 3) LEGACY (public-only) derivation retained for back-compat restore.
+// Legacy derivation (for old entries)
 async function deriveTagKeyNonce_Legacy(
   account: Hex,
   recordAddr: Hex,
   contentHash: Uint8Array
 ): Promise<{ tagHex: Hex; keyBytes: Uint8Array; nonce: Uint8Array }> {
   const base = concatBytes(enc.encode("PC-DERIVE"), hexToBytes(account), hexToBytes(recordAddr), contentHash);
-  const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16); // 16 bytes
-  const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base)); // 32 bytes
-  const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12); // 12 bytes
+  const tag   = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
+  const key   =  await sha256Bytes(concatBytes(enc.encode("KEY"), base));
+  const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12);
   return { tagHex: toHex(tag) as Hex, keyBytes: key, nonce };
 }
 
 async function aesGcmEncrypt(keyBytes: Uint8Array, nonce: Uint8Array, plaintext: Uint8Array): Promise<Uint8Array> {
   const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plaintext);
+  const ct  = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, plaintext);
   return new Uint8Array(ct);
 }
-
 async function aesGcmDecrypt(keyBytes: Uint8Array, nonce: Uint8Array, ciphertext: Uint8Array): Promise<Uint8Array> {
   const key = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["decrypt"]);
-  const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ciphertext);
+  const pt  = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ciphertext);
   return new Uint8Array(pt);
 }
 
@@ -275,6 +239,52 @@ async function fetchCiphertextByTag(tagHex: Hex): Promise<Hex | null> {
   return null;
 }
 
+// ---------- Auto-detect vault write shape (args & return) ----------
+const ABI_CT_TAG_NORET = [
+  { type: "function", name: "put", stateMutability: "nonpayable",
+    inputs: [{ name: "ciphertext", type: "bytes" }, { name: "tag", type: "bytes16" }], outputs: [] },
+] as const;
+const ABI_TAG_CT_NORET = [
+  { type: "function", name: "put", stateMutability: "nonpayable",
+    inputs: [{ name: "tag", type: "bytes16" }, { name: "ciphertext", type: "bytes" }], outputs: [] },
+] as const;
+const ABI_CT_TAG_RET   = [
+  { type: "function", name: "put", stateMutability: "nonpayable",
+    inputs: [{ name: "ciphertext", type: "bytes" }, { name: "tag", type: "bytes16" }], outputs: [{ type: "bytes32" }] },
+] as const;
+const ABI_TAG_CT_RET   = [
+  { type: "function", name: "put", stateMutability: "nonpayable",
+    inputs: [{ name: "tag", type: "bytes16" }, { name: "ciphertext", type: "bytes" }], outputs: [{ type: "bytes32" }] },
+] as const;
+
+type PutVariant = "ct,tag (no-ret)" | "tag,ct (no-ret)" | "ct,tag (returns)" | "tag,ct (returns)";
+
+async function simulatePutAuto(from: Hex, ctHex: Hex, tagHex: Hex) {
+  const candidates: Array<{ abi: any; args: [Hex, Hex]; label: PutVariant }> = [
+    { abi: ABI_CT_TAG_NORET, args: [ctHex, tagHex], label: "ct,tag (no-ret)" },
+    { abi: ABI_TAG_CT_NORET, args: [tagHex, ctHex], label: "tag,ct (no-ret)" },
+    { abi: ABI_CT_TAG_RET,   args: [ctHex, tagHex], label: "ct,tag (returns)" },
+    { abi: ABI_TAG_CT_RET,   args: [tagHex, ctHex], label: "tag,ct (returns)" },
+  ];
+
+  const errors: string[] = [];
+  for (const c of candidates) {
+    try {
+      const { request } = await l2Public.simulateContract({
+        address: env.vault as `0x${string}`,
+        abi: c.abi,
+        functionName: "put",
+        args: c.args,
+        account: from,
+      });
+      return { request, label: c.label };
+    } catch (e: any) {
+      errors.push(`${c.label}: ${e?.shortMessage || e?.message || String(e)}`);
+    }
+  }
+  throw new Error("All put() variants failed:\n" + errors.join("\n"));
+}
+
 export default function App() {
   const [account, setAccount] = useState<Hex>("0x0000000000000000000000000000000000000000");
   const [recordAddr, setRecord] = useState<Hex>("0x0000000000000000000000000000000000000000");
@@ -296,18 +306,13 @@ export default function App() {
 
   async function connect() {
     const eth = (window as any).ethereum;
-    if (!eth) {
-      alert("MetaMask not found");
-      return;
-    }
+    if (!eth) { alert("MetaMask not found"); return; }
     const [addr] = await eth.request({ method: "eth_requestAccounts" });
     setAccount(addr);
   }
 
   async function ensureRecord() {
-    if (!account || account === "0x0000000000000000000000000000000000000000") {
-      return alert("Connect MetaMask first");
-    }
+    if (!account || account === "0x0000000000000000000000000000000000000000") return alert("Connect MetaMask first");
     await ensureChain(env.l1Id, env.l1Url);
     setStatus("Checking/creating your L1 PatientRecord…");
 
@@ -318,10 +323,7 @@ export default function App() {
       const w = walletL1();
       const [from] = await w.getAddresses();
       const { request } = await l1Public.simulateContract({
-        address: env.factory,
-        abi: factoryAbi,
-        functionName: "createRecord",
-        account: from,
+        address: env.factory, abi: factoryAbi, functionName: "createRecord", account: from,
       });
       const txHash = await w.writeContract(request);
       setStatus("Tx sent to create record — waiting for confirmation…");
@@ -340,9 +342,7 @@ export default function App() {
 
   async function authorizeKeyDerivation() {
     try {
-      if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
-        return alert("Ensure your record first");
-      }
+      if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") return alert("Ensure your record first");
       setStatus("Requesting wallet signature for key derivation…");
       const r = await deriveRootViaSignature(recordAddr);
       setRoot(r);
@@ -355,9 +355,7 @@ export default function App() {
 
   async function hashAndAnchorL1() {
     try {
-      if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
-        return alert("Ensure your record first");
-      }
+      if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") return alert("Ensure your record first");
       setStatus("Switching to L1…");
       await ensureChain(env.l1Id, env.l1Url);
 
@@ -370,14 +368,10 @@ export default function App() {
       const w = walletL1();
       const [from] = await w.getAddresses();
 
-      // Preflight to surface ABI/arg errors immediately
       setStatus("Preflighting anchor call…");
       const { request } = await l1Public.simulateContract({
-        address: recordAddr,
-        abi: patientRecordAbi,
-        functionName: "anchor",
-        args: [hex as Hex, env.l2Id], // uint32 -> number
-        account: from,
+        address: recordAddr, abi: patientRecordAbi, functionName: "anchor",
+        args: [hex as Hex, env.l2Id], account: from,
       });
 
       setStatus("Requesting wallet confirmation…");
@@ -400,39 +394,32 @@ export default function App() {
       if (!account || account === "0x0000000000000000000000000000000000000000") return alert("Connect MetaMask first");
       if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") return alert("Ensure your record first");
       if (!root) return alert("Click “Authorize key derivation (sign)” first.");
+
       setStatus("Switching to L2…");
       await ensureChain(env.l2Id, env.l2Url);
+
       setStatus("Encrypting and storing ciphertext on L2…");
-
-      // Canonicalize & hash (for deterministic derivation)
       const canonical = canonicalBytesFromJson(jsonText);
-      const digest = await sha256Bytes(canonical); // 32 bytes
-
-      // NEW: secret, wallet-bound derivation
+      const digest = await sha256Bytes(canonical);
       const { tagHex, keyBytes, nonce } = await deriveTagKeyNonceFromRoot(root, recordAddr, digest);
-
       const ciphertext = await aesGcmEncrypt(keyBytes, nonce, canonical);
       const ctHex = toHex(ciphertext);
+      setL2Tag(tagHex);
 
       const w = walletL2();
       const [from] = await w.getAddresses();
 
-      // Preflight
-      const { request } = await l2Public.simulateContract({
-        address: env.vault as `0x${string}`,
-        abi: vaultWriteAbi,
-        functionName: "put",
-        args: [ctHex as Hex, tagHex as Hex], // ciphertext FIRST, tag SECOND
-        account: from,
-      });
+      // Auto-detect the correct put() shape via simulation
+      setStatus("Detecting vault put() shape…");
+      const { request, label } = await simulatePutAuto(from, ctHex as Hex, tagHex as Hex);
 
+      setStatus(`Requesting wallet confirmation (using ${label})…`);
       const txHash = await w.writeContract(request);
       setLastTx(txHash as string);
       setStatus("Tx sent — waiting for L2 confirmation…");
       await l2Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-      setL2Tag(tagHex);
       setDidStore(true);
-      setStatus("✅ Stored on L2 (ciphertext vault). Optional: re-run Anchor to link this snapshot explicitly.");
+      setStatus(`✅ Stored on L2 via ${label}. Optional: re-run Anchor to link this snapshot explicitly.`);
       document.getElementById("quick-actions")?.scrollIntoView({ behavior: "smooth", block: "center" });
     } catch (e: any) {
       console.error("l2 store error", e);
@@ -446,68 +433,47 @@ export default function App() {
       if (!root) return alert("Click “Authorize key derivation (sign)” first.");
       setStatus("Restoring with wallet-bound derivation…");
 
-      // Read timeline from L1
       const rec = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
       const seq = Number(await rec.read.seq());
 
-      // Auto-detect 1-indexed vs 0-indexed
       const indices: number[] = [];
-      try {
-        await rec.read.contentHashAt([1n]); // succeeds if 1-indexed
-        for (let i = 1; i <= seq; i++) indices.push(i);
-      } catch {
-        for (let i = 0; i < seq; i++) indices.push(i);
-      }
+      try { await rec.read.contentHashAt([1n]); for (let i = 1; i <= seq; i++) indices.push(i); }
+      catch { for (let i = 0; i < seq; i++) indices.push(i); }
 
       const out: RestoreRow[] = [];
-
       for (const i of indices) {
         const chHex = (await rec.read.contentHashAt([BigInt(i)])) as Hex;
         const chBytes = hexToBytes(chHex);
 
-        // Preferred: root derivation (secret)
+        // root path
         const rootDer = await deriveTagKeyNonceFromRoot(root, recordAddr, chBytes);
         let tagTried: Hex = rootDer.tagHex as Hex;
         let ctHex = await fetchCiphertextByTag(tagTried);
-        let mode: "root" | "legacy" | undefined = undefined;
+        let mode: "root" | "legacy" | undefined;
         let pt: Uint8Array | null = null;
 
         if (ctHex && ctHex !== "0x") {
-          try {
-            pt = await aesGcmDecrypt(rootDer.keyBytes, rootDer.nonce, hexToBytes(ctHex));
-            mode = "root";
-          } catch {}
+          try { pt = await aesGcmDecrypt(rootDer.keyBytes, rootDer.nonce, hexToBytes(ctHex)); mode = "root"; } catch {}
         }
 
-        // Legacy fallback (old entries created with public-only derivation)
+        // legacy fallback
         if (!pt) {
           const legacyDer = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes);
           tagTried = legacyDer.tagHex as Hex;
           ctHex = await fetchCiphertextByTag(tagTried);
           if (ctHex && ctHex !== "0x") {
-            try {
-              pt = await aesGcmDecrypt(legacyDer.keyBytes, legacyDer.nonce, hexToBytes(ctHex));
-              mode = "legacy";
-            } catch {}
+            try { pt = await aesGcmDecrypt(legacyDer.keyBytes, legacyDer.nonce, hexToBytes(ctHex)); mode = "legacy"; } catch {}
           }
         }
 
-        if (!pt) {
-          out.push({ i, ok: false, tag: tagTried, ch: chHex, missing: true });
-          continue;
-        }
+        if (!pt) { out.push({ i, ok: false, tag: tagTried, ch: chHex, missing: true }); continue; }
 
-        // Verify against L1 contentHash
         const check = await sha256Bytes(pt);
         const ok = toHex(check).toLowerCase() === (chHex as string).toLowerCase();
 
-        let preview: string | undefined = undefined;
-        try {
-          const j = JSON.parse(dec.decode(pt));
-          const s = JSON.stringify(j);
-          preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
-        } catch {}
-
+        let preview: string | undefined;
+        try { const j = JSON.parse(dec.decode(pt)); const s = JSON.stringify(j);
+              preview = s.slice(0, 140) + (s.length > 140 ? "…" : ""); } catch {}
         out.push({ i, ok, tag: tagTried, ch: chHex, preview, mode });
       }
 
@@ -548,7 +514,6 @@ export default function App() {
       if (!ctHex) return alert("Ciphertext not found in vault for this tag.");
 
       const pt = await aesGcmDecrypt(keyBytes, nonce, hexToBytes(ctHex));
-      // verify against L1 contentHash
       const digest = await sha256Bytes(pt);
       const ok = toHex(digest).toLowerCase() === (r.ch as string).toLowerCase();
       if (!ok) return alert("Hash mismatch — refusing to export plaintext.");
@@ -587,21 +552,9 @@ export default function App() {
         <button onClick={encryptAndStoreL2}>Encrypt & Store to L2 Vault</button>
       </div>
 
-      {hashHex && (
-        <p style={{ marginTop: 8, wordBreak: "break-all" }}>
-          <b>contentHash (L1):</b> {hashHex}
-        </p>
-      )}
-      {l2Tag && (
-        <p style={{ marginTop: 8, wordBreak: "break-all" }}>
-          <b>tag (L2):</b> {l2Tag}
-        </p>
-      )}
-      {lastTx && (
-        <p style={{ marginTop: 8, wordBreak: "break-all" }}>
-          <b>last tx:</b> {lastTx}
-        </p>
-      )}
+      {hashHex && <p style={{ marginTop: 8, wordBreak: "break-all" }}><b>contentHash (L1):</b> {hashHex}</p>}
+      {l2Tag &&  <p style={{ marginTop: 8, wordBreak: "break-all" }}><b>tag (L2):</b> {l2Tag}</p>}
+      {lastTx && <p style={{ marginTop: 8, wordBreak: "break-all" }}><b>last tx:</b> {lastTx}</p>}
 
       <hr style={{ margin: "24px 0" }} />
 
@@ -625,14 +578,10 @@ export default function App() {
                 ) : r.mode === "root" ? (
                   <span style={{ opacity: 0.6 }}> (wallet-derived)</span>
                 ) : null}
-                {r.preview && (
-                  <div style={{ fontSize: 12, opacity: 0.8, wordBreak: "break-all" }}>preview: {r.preview}</div>
-                )}
+                {r.preview && <div style={{ fontSize: 12, opacity: 0.8, wordBreak: "break-all" }}>preview: {r.preview}</div>}
                 <div style={{ marginTop: 4 }}>
                   <button onClick={() => onDownloadCipher(r)}>⬇ ciphertext</button>{" "}
-                  <button onClick={() => onDownloadDecrypted(r)} disabled={!r.ok}>
-                    ⬇ FHIR JSON
-                  </button>
+                  <button onClick={() => onDownloadDecrypted(r)} disabled={!r.ok}>⬇ FHIR JSON</button>
                 </div>
               </li>
             ))}
@@ -666,6 +615,7 @@ export default function App() {
           Order tip: You can store on L2 first and anchor after, or anchor first and store next — hashes verify either way.
         </div>
       </div>
+
       <p style={{ opacity: 0.7, fontSize: 13, marginTop: 12 }}>
         Tip: If your deployed vault uses <code>bytes32</code> tags, update the ABI types (and derivation slice) accordingly.
         Also, ensure your vault does <b>not emit</b> events with tags/ciphertexts to avoid public tag harvesting.
