@@ -90,7 +90,7 @@ function u64be(n) {
     new DataView(b.buffer).setBigUint64(0, BigInt(n), false);
     return b;
 }
-// Small helpers for download + filenames
+// Small helpers
 function downloadBytes(bytes, filename, mime = "application/octet-stream") {
     const blob = new Blob([bytes], { type: mime });
     const url = URL.createObjectURL(blob);
@@ -116,7 +116,7 @@ async function deriveRootViaSignature(recordAddr) {
     });
     return await sha256Bytes(hexToBytes(sig)); // 32-byte root
 }
-// A) NEW: index-based derivation (no plaintext hash used)
+// A) Preferred: index-based (no plaintext hash used)
 async function deriveTagKeyNonceFromRootIndex(root, recordAddr, i) {
     const base = concatBytes(enc.encode("PC-DERIVE-ROOT-I"), root, hexToBytes(recordAddr), u64be(i));
     const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16); // bytes16
@@ -235,25 +235,66 @@ export default function App() {
         const [addr] = await eth.request({ method: "eth_requestAccounts" });
         setAccount(addr);
     }
+    // Robust + diagnostic ensureRecord
     async function ensureRecord() {
-        if (!account || account === "0x0000000000000000000000000000000000000000")
-            return alert("Connect MetaMask first");
-        await ensureChain(env.l1Id, env.l1Url);
-        setStatus("Checking/creating your L1 PatientRecord…");
-        const factory = getContract({ address: env.factory, abi: factoryAbi, client: l1Public });
-        let rec = (await factory.read.recordOf([account]));
-        if (rec === "0x0000000000000000000000000000000000000000") {
-            const w = walletL1();
-            const [from] = await w.getAddresses();
-            const { request } = await l1Public.simulateContract({ address: env.factory, abi: factoryAbi, functionName: "createRecord", account: from });
-            const txHash = await w.writeContract(request);
-            setStatus("Tx sent to create record — waiting for confirmation…");
-            setLastTx(txHash);
-            await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-            rec = (await factory.read.recordOf([account]));
+        if (!account || account === "0x0000000000000000000000000000000000000000") {
+            alert("Connect MetaMask first");
+            return;
         }
-        setRecord(rec);
-        setStatus(`✅ Record ready: ${rec}`);
+        if (!/^0x[0-9a-fA-F]{40}$/.test(env.factory || "")) {
+            setStatus("❌ VITE_FACTORY_ADDRESS is missing or invalid.");
+            return;
+        }
+        try {
+            setStatus("Switching to L1 & checking your PatientRecord…");
+            await ensureChain(env.l1Id, env.l1Url);
+            // verify wallet really switched
+            const eth = window.ethereum;
+            const curHex = await eth.request({ method: "eth_chainId" });
+            const cur = parseInt(curHex, 16);
+            if (cur !== env.l1Id)
+                throw new Error(`Wallet is on chainId ${cur} but expected ${env.l1Id}`);
+            // ping L1 RPC
+            await l1Public.getBlockNumber();
+            const factory = getContract({ address: env.factory, abi: factoryAbi, client: l1Public });
+            // read recordOf
+            let rec;
+            try {
+                rec = (await factory.read.recordOf([account]));
+            }
+            catch (e) {
+                throw new Error("factory.recordOf failed — check VITE_L1_RPC_URL / VITE_FACTORY_ADDRESS. " + (e?.shortMessage || e?.message || String(e)));
+            }
+            if (!rec || rec === "0x0000000000000000000000000000000000000000") {
+                const w = walletL1();
+                const [from] = await w.getAddresses();
+                let request;
+                try {
+                    ({ request } = await l1Public.simulateContract({
+                        address: env.factory, abi: factoryAbi, functionName: "createRecord", account: from,
+                    }));
+                }
+                catch (e) {
+                    throw new Error("simulate createRecord failed — is the factory ABI/address correct? " + (e?.shortMessage || e?.message || String(e)));
+                }
+                setStatus("Requesting wallet confirmation to create record…");
+                const txHash = await w.writeContract(request);
+                setLastTx(txHash);
+                setStatus("Tx sent — waiting for 1 confirmation…");
+                await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
+                rec = (await factory.read.recordOf([account]));
+                if (!rec || rec === "0x0000000000000000000000000000000000000000") {
+                    throw new Error("Record still zero address after create — did the transaction succeed on the correct chain?");
+                }
+            }
+            setRecord(rec);
+            setStatus(`✅ Record ready: ${rec}`);
+        }
+        catch (e) {
+            console.error("ensureRecord error", e);
+            const msg = e?.shortMessage || e?.message || String(e);
+            setStatus("❌ L1 check/create failed: " + msg);
+        }
     }
     function canonicalBytesFromJson(text) {
         const obj = JSON.parse(text);
@@ -261,8 +302,9 @@ export default function App() {
     }
     async function authorizeKeyDerivation() {
         try {
-            if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000")
+            if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
                 return alert("Ensure your record first");
+            }
             setStatus("Requesting wallet signature for key derivation…");
             const r = await deriveRootViaSignature(recordAddr);
             setRoot(r);
@@ -275,8 +317,9 @@ export default function App() {
     }
     async function hashAndAnchorL1() {
         try {
-            if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000")
+            if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") {
                 return alert("Ensure your record first");
+            }
             setStatus("Switching to L1…");
             await ensureChain(env.l1Id, env.l1Url);
             setStatus("Computing canonical hash…");
@@ -288,8 +331,7 @@ export default function App() {
             const [from] = await w.getAddresses();
             setStatus("Preflighting anchor call…");
             const { request } = await l1Public.simulateContract({
-                address: recordAddr, abi: patientRecordAbi, functionName: "anchor",
-                args: [hex, env.l2Id], account: from,
+                address: recordAddr, abi: patientRecordAbi, functionName: "anchor", args: [hex, env.l2Id], account: from,
             });
             setStatus("Requesting wallet confirmation…");
             const txHash = await w.writeContract(request);
@@ -320,7 +362,6 @@ export default function App() {
             const seq = Number(await rec.read.seq());
             const iNext = seq + 1;
             setStatus(`Encrypting snapshot #${iNext} and storing on L2…`);
-            // Derive tag/key/nonce from (root, record, index)
             const { tagHex, keyBytes, nonce } = await deriveTagKeyNonceFromRootIndex(root, recordAddr, iNext);
             const canonical = canonicalBytesFromJson(jsonText);
             const ciphertext = await aesGcmEncrypt(keyBytes, nonce, canonical);
@@ -328,7 +369,7 @@ export default function App() {
             setL2Tag(tagHex);
             const w = walletL2();
             const [from] = await w.getAddresses();
-            // Auto-detect the correct put() shape via simulation
+            // Auto-detect put() shape
             setStatus("Detecting vault put() shape…");
             const { request, label } = await simulatePutAuto(from, ctHex, tagHex);
             setStatus(`Requesting wallet confirmation (using ${label})…`);
@@ -367,12 +408,12 @@ export default function App() {
             }
             const out = [];
             for (const i of indices) {
-                const chHex = (await rec.read.contentHashAt([BigInt(i)])); // only used for verification after decrypt
+                const chHex = (await rec.read.contentHashAt([BigInt(i)])); // used ONLY after decrypt to verify
                 const chBytes = hexToBytes(chHex);
-                // A) root + index (preferred)
                 let triedTag = null;
                 let pt = null;
                 let mode;
+                // A) root + index (preferred)
                 {
                     const d = await deriveTagKeyNonceFromRootIndex(root, recordAddr, i);
                     triedTag = d.tagHex;
@@ -480,7 +521,7 @@ export default function App() {
             alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
-    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" }), " ", _jsx("button", { onClick: authorizeKeyDerivation, disabled: !recordAddr || recordAddr.endsWith("0000"), children: "Authorize key derivation (sign)" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] }), root ? _jsx("div", { style: { color: "#0a0" }, children: "\uD83D\uDD11 Key derivation active (session)" }) : null] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] }), l2Tag && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] }), lastTx && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] }), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "We derive tag/key/nonce from your wallet secret (off-chain) + record + index, fetch ciphertext, decrypt locally, then verify against L1." }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromWallet, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.mode === "legacy" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (legacy)" })) : r.mode === "root-ch" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+contentHash)" })) : r.mode === "root-index" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+index)" })) : null, r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
+    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" }), " ", _jsx("button", { onClick: authorizeKeyDerivation, disabled: !recordAddr || recordAddr.endsWith("0000"), children: "Authorize key derivation (sign)" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] }), root ? _jsx("div", { style: { color: "#0a0" }, children: "\uD83D\uDD11 Key derivation active (session)" }) : null] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] }), l2Tag && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] }), lastTx && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] }), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "We derive tag/key/nonce from your wallet secret (off-chain) + record (+ index or content hash for compat), fetch ciphertext, decrypt locally, then verify against L1." }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromWallet, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.mode === "legacy" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (legacy)" })) : r.mode === "root-ch" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+contentHash)" })) : r.mode === "root-index" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+index)" })) : null, r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
                     marginTop: 8,
                     padding: 12,
                     borderRadius: 12,
