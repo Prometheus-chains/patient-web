@@ -24,6 +24,8 @@ const env = {
   vault: import.meta.env.VITE_VAULT_ADDRESS as `0x${string}`,
 };
 
+const ZERO_ADDR = "0x0000000000000000000000000000000000000000" as const;
+
 // Help MetaMask add/switch chains if needed
 const PRESETS: Record<number, { chainName: string; explorer: string; symbol: string }> = {
   11155111: { chainName: "Sepolia",      explorer: "https://sepolia.etherscan.io",  symbol: "ETH" },
@@ -85,6 +87,16 @@ async function ensureChain(targetId: number, rpcUrl?: string) {
       await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainIdHex }] });
     } else { throw e; }
   }
+}
+
+// Quick on-chain code checks to fail fast on wrong addresses
+async function assertCodeAtL1(addr: `0x${string}`) {
+  const code = await l1Public.getBytecode({ address: addr });
+  if (!code) throw new Error(`No contract code at ${addr} on L1 chain ${env.l1Id}.`);
+}
+async function assertCodeAtL2(addr: `0x${string}`) {
+  const code = await l2Public.getBytecode({ address: addr });
+  if (!code) throw new Error(`No contract code at ${addr} on L2 chain ${env.l2Id}.`);
 }
 
 // ────────────────────────────────────────────────────────────────────────────────
@@ -168,8 +180,8 @@ async function fetchCiphertextByTag(tagHex: Hex): Promise<Hex | null> {
 type RestoreRow = { i: number; ok: boolean; tag: string; ch: string; preview?: string; missing?: boolean };
 
 export default function App() {
-  const [account, setAccount]   = useState<Hex>("0x0000000000000000000000000000000000000000");
-  const [recordAddr, setRecord] = useState<Hex>("0x0000000000000000000000000000000000000000");
+  const [account, setAccount]   = useState<Hex>(ZERO_ADDR);
+  const [recordAddr, setRecord] = useState<Hex>(ZERO_ADDR);
   const [status, setStatus]     = useState<string>("");
   const [jsonText, setJson]     = useState<string>('{"resourceType":"Bundle","type":"collection","entry":[{"resource":{"resourceType":"Patient","id":"me"}}]}');
   const [hashHex, setHashHex]   = useState<string>("");
@@ -189,30 +201,52 @@ export default function App() {
   }
 
   async function ensureRecord() {
-    if (!account || account === "0x0000000000000000000000000000000000000000") return alert("Connect MetaMask first");
-    await ensureChain(env.l1Id, env.l1Url);
-    setStatus("Checking/creating your L1 PatientRecord…");
+    try {
+      if (!account || account === ZERO_ADDR) return alert("Connect MetaMask first");
+      setStatus("Switching to L1…");
+      await ensureChain(env.l1Id, env.l1Url);
 
-    const factory = getContract({ address: env.factory, abi: factoryAbi, client: l1Public });
-    let rec = (await factory.read.recordOf([account])) as Hex;
+      setStatus("Checking factory…");
+      await assertCodeAtL1(env.factory);
 
-    if (rec === "0x0000000000000000000000000000000000000000") {
-      const w = walletL1();
-      const [from] = await w.getAddresses();
-      const { request } = await l1Public.simulateContract({ address: env.factory, abi: factoryAbi, functionName: "createRecord", account: from });
-      const txHash = await w.writeContract(request);
-      setStatus("Tx sent to create record — waiting for confirmation…");
-      setLastTx(txHash as string);
-      await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
-      rec = (await factory.read.recordOf([account])) as Hex;
+      setStatus("Checking/creating your L1 PatientRecord…");
+      const factory = getContract({ address: env.factory, abi: factoryAbi, client: l1Public });
+      let rec: Hex;
+      try {
+        rec = (await factory.read.recordOf([account])) as Hex;
+      } catch (e: any) {
+        throw new Error("recordOf() failed — verify chain & factory address. " + (e?.shortMessage || e?.message || String(e)));
+      }
+
+      if (rec === ZERO_ADDR) {
+        const w = walletL1();
+        const [from] = await w.getAddresses();
+        let request;
+        try {
+          const sim = await l1Public.simulateContract({ address: env.factory, abi: factoryAbi, functionName: "createRecord", account: from });
+          request = sim.request;
+        } catch (e: any) {
+          throw new Error("Simulation for createRecord() failed. " + (e?.shortMessage || e?.message || String(e)));
+        }
+        const txHash = await w.writeContract(request);
+        setStatus("Tx sent to create record — waiting for confirmation…");
+        setLastTx(txHash as string);
+        await l1Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
+        rec = (await factory.read.recordOf([account])) as Hex;
+        if (rec === ZERO_ADDR) throw new Error("Record still zero after tx confirmation.");
+      }
+
+      setRecord(rec);
+      setStatus(`✅ Record ready: ${rec}`);
+    } catch (e: any) {
+      console.error("ensureRecord error", e);
+      setStatus("❌ " + (e?.shortMessage || e?.message || String(e)));
     }
-    setRecord(rec);
-    setStatus(`✅ Record ready: ${rec}`);
   }
 
   async function authorizeKeyDerivation() {
     try {
-      if (!recordAddr || recordAddr.endsWith("0000")) return alert("Ensure your record first");
+      if (!recordAddr || recordAddr === ZERO_ADDR) return alert("Ensure your record first");
       setStatus("Requesting wallet signature for key derivation…");
       const r = await deriveRootViaSignature(recordAddr);
       setRoot(r);
@@ -225,7 +259,7 @@ export default function App() {
 
   async function hashAndAnchorL1() {
     try {
-      if (!recordAddr || recordAddr.endsWith("0000")) return alert("Ensure your record first");
+      if (!recordAddr || recordAddr === ZERO_ADDR) return alert("Ensure your record first");
       setStatus("Switching to L1…");
       await ensureChain(env.l1Id, env.l1Url);
 
@@ -255,11 +289,11 @@ export default function App() {
     }
   }
 
-  // SIMPLIFIED: anchor-first only. We always store for index = current seq (just appended).
+  // Anchor-first only. We always store for index = current seq (just appended).
   async function encryptAndStoreL2() {
     try {
-      if (!account || account.endsWith("0000")) return alert("Connect MetaMask first");
-      if (!recordAddr || recordAddr.endsWith("0000")) return alert("Ensure your record first");
+      if (!account || account === ZERO_ADDR) return alert("Connect MetaMask first");
+      if (!recordAddr || recordAddr === ZERO_ADDR) return alert("Ensure your record first");
       if (!root) return alert("Click “Authorize key derivation (sign)” first.");
 
       // Determine current seq on L1; require at least 1 anchor.
@@ -268,8 +302,11 @@ export default function App() {
       if (seq === 0) return alert("Anchor to L1 first, then store to L2.");
       const i = seq; // store for the just-anchored entry
 
-      setStatus(`Switching to L2…`);
+      setStatus("Switching to L2…");
       await ensureChain(env.l2Id, env.l2Url);
+
+      setStatus("Checking vault…");
+      await assertCodeAtL2(env.vault);
 
       setStatus(`Encrypting snapshot #${i} and storing on L2…`);
       const canonical = canonicalBytesFromJson(jsonText);
@@ -298,7 +335,7 @@ export default function App() {
 
   async function restoreFromWallet() {
     try {
-      if (!recordAddr || recordAddr.endsWith("0000")) return alert("Ensure your record first");
+      if (!recordAddr || recordAddr === ZERO_ADDR) return alert("Ensure your record first");
       if (!root) return alert("Click “Authorize key derivation (sign)” first.");
       setStatus("Restoring with wallet-bound derivation…");
 
@@ -362,7 +399,7 @@ export default function App() {
       <div style={{ marginBottom: 12 }}>
         <button onClick={connect}>Connect Wallet</button>{" "}
         <button onClick={ensureRecord}>Check / Create L1 PatientRecord</button>{" "}
-        <button onClick={authorizeKeyDerivation} disabled={!recordAddr || recordAddr.endsWith("0000")}>
+        <button onClick={authorizeKeyDerivation} disabled={!recordAddr || recordAddr === ZERO_ADDR}>
           Authorize key derivation (sign)
         </button>
       </div>
