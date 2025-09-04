@@ -116,8 +116,7 @@ async function deriveRootViaSignature(recordAddr) {
     });
     return await sha256Bytes(hexToBytes(sig)); // 32-byte root
 }
-// NEW: index-based derivation (no plaintext hash involved)
-// base = "PC-DERIVE-ROOT-I" || root || recordAddr || u64be(i)
+// A) NEW: index-based derivation (no plaintext hash used)
 async function deriveTagKeyNonceFromRootIndex(root, recordAddr, i) {
     const base = concatBytes(enc.encode("PC-DERIVE-ROOT-I"), root, hexToBytes(recordAddr), u64be(i));
     const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16); // bytes16
@@ -125,7 +124,15 @@ async function deriveTagKeyNonceFromRootIndex(root, recordAddr, i) {
     const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12); // 12 bytes
     return { tagHex: toHex(tag), keyBytes: key, nonce };
 }
-// Legacy derivation (for old entries that used contentHash in derivation)
+// B) Compat: root + contentHash (for mid-era entries)
+async function deriveTagKeyNonceFromRootContentHash(root, recordAddr, contentHash) {
+    const base = concatBytes(enc.encode("PC-DERIVE-ROOT-CH"), root, hexToBytes(recordAddr), contentHash);
+    const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
+    const key = await sha256Bytes(concatBytes(enc.encode("KEY"), base));
+    const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12);
+    return { tagHex: toHex(tag), keyBytes: key, nonce };
+}
+// C) Legacy: public + contentHash (oldest entries)
 async function deriveTagKeyNonce_Legacy(account, recordAddr, contentHash) {
     const base = concatBytes(enc.encode("PC-DERIVE"), hexToBytes(account), hexToBytes(recordAddr), contentHash);
     const tag = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
@@ -330,7 +337,7 @@ export default function App() {
             setStatus("Tx sent — waiting for L2 confirmation…");
             await l2Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
             setDidStore(true);
-            setStatus(`✅ Stored snapshot #${iNext} on L2 via ${label}. You may now anchor on L1 (any order is okay).`);
+            setStatus(`✅ Stored snapshot #${iNext} on L2 via ${label}. You may anchor on L1 now or later.`);
             document.getElementById("quick-actions")?.scrollIntoView({ behavior: "smooth", block: "center" });
         }
         catch (e) {
@@ -344,7 +351,7 @@ export default function App() {
                 return alert("Ensure your record first");
             if (!root)
                 return alert("Click “Authorize key derivation (sign)” first.");
-            setStatus("Restoring with wallet-bound index derivation…");
+            setStatus("Restoring with wallet-bound derivation…");
             const rec = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
             const seq = Number(await rec.read.seq());
             // Detect 1-indexed vs 0-indexed (most PatientRecord impls are 1-indexed)
@@ -360,36 +367,52 @@ export default function App() {
             }
             const out = [];
             for (const i of indices) {
-                const chHex = (await rec.read.contentHashAt([BigInt(i)])); // used ONLY for verification after decrypt
+                const chHex = (await rec.read.contentHashAt([BigInt(i)])); // only used for verification after decrypt
                 const chBytes = hexToBytes(chHex);
-                // Primary: derive from (root, record, index)
-                const rootDer = await deriveTagKeyNonceFromRootIndex(root, recordAddr, i);
-                let tagTried = rootDer.tagHex;
-                let ctHex = await fetchCiphertextByTag(tagTried);
-                let mode;
+                // A) root + index (preferred)
+                let triedTag = null;
                 let pt = null;
-                if (ctHex && ctHex !== "0x") {
-                    try {
-                        pt = await aesGcmDecrypt(rootDer.keyBytes, rootDer.nonce, hexToBytes(ctHex));
-                        mode = "root-index";
-                    }
-                    catch { }
-                }
-                // Legacy fallback for early entries that used contentHash in derivation
-                if (!pt) {
-                    const legacyDer = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes);
-                    tagTried = legacyDer.tagHex;
-                    ctHex = await fetchCiphertextByTag(tagTried);
+                let mode;
+                {
+                    const d = await deriveTagKeyNonceFromRootIndex(root, recordAddr, i);
+                    triedTag = d.tagHex;
+                    const ctHex = await fetchCiphertextByTag(triedTag);
                     if (ctHex && ctHex !== "0x") {
                         try {
-                            pt = await aesGcmDecrypt(legacyDer.keyBytes, legacyDer.nonce, hexToBytes(ctHex));
+                            pt = await aesGcmDecrypt(d.keyBytes, d.nonce, hexToBytes(ctHex));
+                            mode = "root-index";
+                        }
+                        catch { }
+                    }
+                }
+                // B) root + contentHash (compat)
+                if (!pt) {
+                    const d = await deriveTagKeyNonceFromRootContentHash(root, recordAddr, chBytes);
+                    triedTag = d.tagHex;
+                    const ctHex = await fetchCiphertextByTag(triedTag);
+                    if (ctHex && ctHex !== "0x") {
+                        try {
+                            pt = await aesGcmDecrypt(d.keyBytes, d.nonce, hexToBytes(ctHex));
+                            mode = "root-ch";
+                        }
+                        catch { }
+                    }
+                }
+                // C) legacy public + contentHash (oldest)
+                if (!pt) {
+                    const d = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes);
+                    triedTag = d.tagHex;
+                    const ctHex = await fetchCiphertextByTag(triedTag);
+                    if (ctHex && ctHex !== "0x") {
+                        try {
+                            pt = await aesGcmDecrypt(d.keyBytes, d.nonce, hexToBytes(ctHex));
                             mode = "legacy";
                         }
                         catch { }
                     }
                 }
                 if (!pt) {
-                    out.push({ i, ok: false, tag: tagTried, ch: chHex, missing: true });
+                    out.push({ i, ok: false, tag: triedTag || "0x", ch: chHex, missing: true });
                     continue;
                 }
                 // Verify AFTER decrypt: sha256(plaintext) must equal L1 contentHashAt(i)
@@ -402,7 +425,7 @@ export default function App() {
                     preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
                 }
                 catch { }
-                out.push({ i, ok, tag: tagTried, ch: chHex, preview, mode });
+                out.push({ i, ok, tag: triedTag, ch: chHex, preview, mode });
             }
             setRestoreResults(out);
             const okCount = out.filter((r) => r.ok).length;
@@ -430,8 +453,12 @@ export default function App() {
         try {
             let keyBytes, nonce;
             if (r.mode === "legacy") {
-                const chBytes = hexToBytes(r.ch);
-                ({ keyBytes, nonce } = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes));
+                ({ keyBytes, nonce } = await deriveTagKeyNonce_Legacy(account, recordAddr, hexToBytes(r.ch)));
+            }
+            else if (r.mode === "root-ch") {
+                if (!root)
+                    return alert("Click “Authorize key derivation (sign)” first.");
+                ({ keyBytes, nonce } = await deriveTagKeyNonceFromRootContentHash(root, recordAddr, hexToBytes(r.ch)));
             }
             else {
                 if (!root)
@@ -453,7 +480,7 @@ export default function App() {
             alert("Download failed: " + (e?.shortMessage || e?.message || String(e)));
         }
     }
-    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" }), " ", _jsx("button", { onClick: authorizeKeyDerivation, disabled: !recordAddr || recordAddr.endsWith("0000"), children: "Authorize key derivation (sign)" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] }), root ? _jsx("div", { style: { color: "#0a0" }, children: "\uD83D\uDD11 Key derivation active (session)" }) : null] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] }), l2Tag && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] }), lastTx && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] }), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "We derive tags/keys per-entry from a wallet signature + index, fetch ciphertext, decrypt locally, then verify against L1." }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromWallet, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.mode === "legacy" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (legacy)" })) : r.mode === "root-index" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+index)" })) : null, r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
+    return (_jsxs("div", { style: { padding: 24, fontFamily: "system-ui, sans-serif", maxWidth: 900, margin: "0 auto" }, children: [_jsx("h1", { children: "Prometheus\u2019 Chains \u2014 Patient Web MVP" }), _jsxs("div", { style: { marginBottom: 12 }, children: [_jsx("button", { onClick: connect, children: "Connect Wallet" }), " ", _jsx("button", { onClick: ensureRecord, children: "Check / Create L1 PatientRecord" }), " ", _jsx("button", { onClick: authorizeKeyDerivation, disabled: !recordAddr || recordAddr.endsWith("0000"), children: "Authorize key derivation (sign)" })] }), _jsxs("div", { style: { opacity: 0.85, marginBottom: 16 }, children: [_jsxs("div", { children: [_jsx("b", { children: "Account:" }), " ", account] }), _jsxs("div", { children: [_jsx("b", { children: "Record:" }), " ", recordAddr] }), _jsxs("div", { children: [_jsx("b", { children: "Env:" }), " L1=", env.l1Id, " \u00B7 L2=", env.l2Id] }), root ? _jsx("div", { style: { color: "#0a0" }, children: "\uD83D\uDD11 Key derivation active (session)" }) : null] }), _jsx("h3", { children: "Paste FHIR JSON (plaintext)" }), _jsx("textarea", { rows: 10, style: { width: "100%" }, value: jsonText, onChange: (e) => setJson(e.target.value) }), _jsxs("div", { style: { marginTop: 12 }, children: [_jsx("button", { onClick: hashAndAnchorL1, children: "Generate Hash & Anchor to L1" }), " ", _jsx("button", { onClick: encryptAndStoreL2, children: "Encrypt & Store to L2 Vault" })] }), hashHex && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "contentHash (L1):" }), " ", hashHex] }), l2Tag && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "tag (L2):" }), " ", l2Tag] }), lastTx && _jsxs("p", { style: { marginTop: 8, wordBreak: "break-all" }, children: [_jsx("b", { children: "last tx:" }), " ", lastTx] }), _jsx("hr", { style: { margin: "24px 0" } }), _jsx("h3", { children: "Restore" }), _jsx("p", { style: { opacity: 0.8, marginTop: -6 }, children: "We derive tag/key/nonce from your wallet secret (off-chain) + record + index, fetch ciphertext, decrypt locally, then verify against L1." }), _jsx("div", { style: { marginTop: 8 }, children: _jsx("button", { onClick: restoreFromWallet, children: "Restore timeline" }) }), restoreResults.length > 0 && (_jsxs("div", { style: { marginTop: 12 }, children: [_jsx("b", { children: "Restored entries:" }), _jsx("ul", { children: restoreResults.map((r) => (_jsxs("li", { style: { margin: "6px 0" }, children: ["#", r.i, " \u2014 tag ", r.tag, " \u2014 ", r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch", r.mode === "legacy" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (legacy)" })) : r.mode === "root-ch" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+contentHash)" })) : r.mode === "root-index" ? (_jsx("span", { style: { opacity: 0.6 }, children: " (wallet+index)" })) : null, r.preview && (_jsxs("div", { style: { fontSize: 12, opacity: 0.8, wordBreak: "break-all" }, children: ["preview: ", r.preview] })), _jsxs("div", { style: { marginTop: 4 }, children: [_jsx("button", { onClick: () => onDownloadCipher(r), children: "\u2B07 ciphertext" }), " ", _jsx("button", { onClick: () => onDownloadDecrypted(r), disabled: !r.ok, children: "\u2B07 FHIR JSON" })] })] }, r.i))) })] })), _jsx("p", { style: { marginTop: 8 }, children: status }), _jsxs("div", { id: "quick-actions", style: {
                     marginTop: 8,
                     padding: 12,
                     borderRadius: 12,

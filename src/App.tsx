@@ -20,7 +20,7 @@ type RestoreRow = {
   ch: string;
   preview?: string;
   missing?: boolean;
-  mode?: "root-index" | "legacy"; // root-index = wallet-bound + index; legacy = old contentHash derivation
+  mode?: "root-index" | "root-ch" | "legacy";
 };
 
 // --- ENV from Vite ---
@@ -142,8 +142,7 @@ async function deriveRootViaSignature(recordAddr: Hex): Promise<Uint8Array> {
   return await sha256Bytes(hexToBytes(sig as Hex)); // 32-byte root
 }
 
-// NEW: index-based derivation (no plaintext hash involved)
-// base = "PC-DERIVE-ROOT-I" || root || recordAddr || u64be(i)
+// A) NEW: index-based derivation (no plaintext hash used)
 async function deriveTagKeyNonceFromRootIndex(
   root: Uint8Array,
   recordAddr: Hex,
@@ -156,7 +155,20 @@ async function deriveTagKeyNonceFromRootIndex(
   return { tagHex: toHex(tag) as Hex, keyBytes: key, nonce };
 }
 
-// Legacy derivation (for old entries that used contentHash in derivation)
+// B) Compat: root + contentHash (for mid-era entries)
+async function deriveTagKeyNonceFromRootContentHash(
+  root: Uint8Array,
+  recordAddr: Hex,
+  contentHash: Uint8Array
+): Promise<{ tagHex: Hex; keyBytes: Uint8Array; nonce: Uint8Array }> {
+  const base = concatBytes(enc.encode("PC-DERIVE-ROOT-CH"), root, hexToBytes(recordAddr), contentHash);
+  const tag   = (await sha256Bytes(concatBytes(enc.encode("TAG"), base))).slice(0, 16);
+  const key   =  await sha256Bytes(concatBytes(enc.encode("KEY"), base));
+  const nonce = (await sha256Bytes(concatBytes(enc.encode("NONCE"), base))).slice(0, 12);
+  return { tagHex: toHex(tag) as Hex, keyBytes: key, nonce };
+}
+
+// C) Legacy: public + contentHash (oldest entries)
 async function deriveTagKeyNonce_Legacy(
   account: Hex,
   recordAddr: Hex,
@@ -379,7 +391,7 @@ export default function App() {
       setStatus("Tx sent — waiting for L2 confirmation…");
       await l2Public.waitForTransactionReceipt({ hash: txHash, confirmations: 1 });
       setDidStore(true);
-      setStatus(`✅ Stored snapshot #${iNext} on L2 via ${label}. You may now anchor on L1 (any order is okay).`);
+      setStatus(`✅ Stored snapshot #${iNext} on L2 via ${label}. You may anchor on L1 now or later.`);
       document.getElementById("quick-actions")?.scrollIntoView({ behavior: "smooth", block: "center" });
     } catch (e: any) {
       console.error("l2 store error", e);
@@ -391,7 +403,7 @@ export default function App() {
     try {
       if (!recordAddr || recordAddr === "0x0000000000000000000000000000000000000000") return alert("Ensure your record first");
       if (!root) return alert("Click “Authorize key derivation (sign)” first.");
-      setStatus("Restoring with wallet-bound index derivation…");
+      setStatus("Restoring with wallet-bound derivation…");
 
       const rec = getContract({ address: recordAddr, abi: patientRecordAbi, client: l1Public });
       const seq = Number(await rec.read.seq());
@@ -404,38 +416,48 @@ export default function App() {
       const out: RestoreRow[] = [];
 
       for (const i of indices) {
-        const chHex = (await rec.read.contentHashAt([BigInt(i)])) as Hex;  // used ONLY for verification after decrypt
+        const chHex = (await rec.read.contentHashAt([BigInt(i)])) as Hex;  // only used for verification after decrypt
         const chBytes = hexToBytes(chHex);
 
-        // Primary: derive from (root, record, index)
-        const rootDer = await deriveTagKeyNonceFromRootIndex(root!, recordAddr, i);
-        let tagTried: Hex = rootDer.tagHex as Hex;
-        let ctHex = await fetchCiphertextByTag(tagTried);
-        let mode: "root-index" | "legacy" | undefined;
+        // A) root + index (preferred)
+        let triedTag: Hex | null = null;
         let pt: Uint8Array | null = null;
+        let mode: "root-index" | "root-ch" | "legacy" | undefined;
 
-        if (ctHex && ctHex !== "0x") {
-          try {
-            pt = await aesGcmDecrypt(rootDer.keyBytes, rootDer.nonce, hexToBytes(ctHex));
-            mode = "root-index";
-          } catch {}
+        {
+          const d = await deriveTagKeyNonceFromRootIndex(root!, recordAddr, i);
+          triedTag = d.tagHex as Hex;
+          const ctHex = await fetchCiphertextByTag(triedTag);
+          if (ctHex && ctHex !== "0x") {
+            try { pt = await aesGcmDecrypt(d.keyBytes, d.nonce, hexToBytes(ctHex)); mode = "root-index"; }
+            catch {}
+          }
         }
 
-        // Legacy fallback for early entries that used contentHash in derivation
+        // B) root + contentHash (compat)
         if (!pt) {
-          const legacyDer = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes);
-          tagTried = legacyDer.tagHex as Hex;
-          ctHex = await fetchCiphertextByTag(tagTried);
+          const d = await deriveTagKeyNonceFromRootContentHash(root!, recordAddr, chBytes);
+          triedTag = d.tagHex as Hex;
+          const ctHex = await fetchCiphertextByTag(triedTag);
           if (ctHex && ctHex !== "0x") {
-            try {
-              pt = await aesGcmDecrypt(legacyDer.keyBytes, legacyDer.nonce, hexToBytes(ctHex));
-              mode = "legacy";
-            } catch {}
+            try { pt = await aesGcmDecrypt(d.keyBytes, d.nonce, hexToBytes(ctHex)); mode = "root-ch"; }
+            catch {}
+          }
+        }
+
+        // C) legacy public + contentHash (oldest)
+        if (!pt) {
+          const d = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes);
+          triedTag = d.tagHex as Hex;
+          const ctHex = await fetchCiphertextByTag(triedTag);
+          if (ctHex && ctHex !== "0x") {
+            try { pt = await aesGcmDecrypt(d.keyBytes, d.nonce, hexToBytes(ctHex)); mode = "legacy"; }
+            catch {}
           }
         }
 
         if (!pt) {
-          out.push({ i, ok: false, tag: tagTried, ch: chHex, missing: true });
+          out.push({ i, ok: false, tag: triedTag || "0x", ch: chHex, missing: true });
           continue;
         }
 
@@ -449,7 +471,7 @@ export default function App() {
           const s = JSON.stringify(j);
           preview = s.slice(0, 140) + (s.length > 140 ? "…" : "");
         } catch {}
-        out.push({ i, ok, tag: tagTried, ch: chHex, preview, mode });
+        out.push({ i, ok, tag: triedTag!, ch: chHex, preview, mode });
       }
 
       setRestoreResults(out);
@@ -478,8 +500,10 @@ export default function App() {
       let keyBytes: Uint8Array, nonce: Uint8Array;
 
       if (r.mode === "legacy") {
-        const chBytes = hexToBytes(r.ch as Hex);
-        ({ keyBytes, nonce } = await deriveTagKeyNonce_Legacy(account, recordAddr, chBytes));
+        ({ keyBytes, nonce } = await deriveTagKeyNonce_Legacy(account, recordAddr, hexToBytes(r.ch as Hex)));
+      } else if (r.mode === "root-ch") {
+        if (!root) return alert("Click “Authorize key derivation (sign)” first.");
+        ({ keyBytes, nonce } = await deriveTagKeyNonceFromRootContentHash(root!, recordAddr, hexToBytes(r.ch as Hex)));
       } else {
         if (!root) return alert("Click “Authorize key derivation (sign)” first.");
         ({ keyBytes, nonce } = await deriveTagKeyNonceFromRootIndex(root!, recordAddr, r.i));
@@ -535,7 +559,7 @@ export default function App() {
 
       <h3>Restore</h3>
       <p style={{ opacity: 0.8, marginTop: -6 }}>
-        We derive tags/keys per-entry from a wallet signature + index, fetch ciphertext, decrypt locally, then verify against L1.
+        We derive tag/key/nonce from your wallet secret (off-chain) + record + index, fetch ciphertext, decrypt locally, then verify against L1.
       </p>
       <div style={{ marginTop: 8 }}>
         <button onClick={restoreFromWallet}>Restore timeline</button>
@@ -550,6 +574,8 @@ export default function App() {
                 #{r.i} — tag {r.tag} — {r.ok ? "✅ verified" : r.missing ? "⚠️ missing on L2" : "❌ hash mismatch"}
                 {r.mode === "legacy" ? (
                   <span style={{ opacity: 0.6 }}> (legacy)</span>
+                ) : r.mode === "root-ch" ? (
+                  <span style={{ opacity: 0.6 }}> (wallet+contentHash)</span>
                 ) : r.mode === "root-index" ? (
                   <span style={{ opacity: 0.6 }}> (wallet+index)</span>
                 ) : null}
