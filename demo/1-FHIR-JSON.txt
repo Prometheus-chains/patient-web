@@ -1,0 +1,97 @@
+{
+  "resourceType": "Bundle",
+  "type": "collection",
+  "timestamp": "2025-09-15T10:05:00-04:00",
+  "identifier": { "system": "https://prometheus.chains/demo", "value": "bundle-pcp-2025-09-15" },
+  "entry": [
+    {
+      "resource": {
+        "resourceType": "Patient",
+        "id": "pat-001",
+        "identifier": [{ "system": "urn:mrn:decatur-family-practice", "value": "DFP-77821" }],
+        "name": [{ "use": "official", "family": "Rossi", "given": ["Giulia"] }],
+        "gender": "female",
+        "birthDate": "1987-03-22"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Organization",
+        "id": "org-dfp",
+        "name": "Decatur Family Practice",
+        "type": [{ "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/organization-type", "code": "prov" }]}]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Practitioner",
+        "id": "prac-pcp",
+        "name": [{ "family": "Nguyen", "given": ["Amelia"], "prefix": ["MD"] }],
+        "identifier": [{ "system": "urn:npi", "value": "1992999999" }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Encounter",
+        "id": "enc-pcp-2025-09-15",
+        "status": "finished",
+        "class": { "system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "AMB" },
+        "subject": { "reference": "Patient/pat-001" },
+        "serviceProvider": { "reference": "Organization/org-dfp" },
+        "period": { "start": "2025-09-15T09:30:00-04:00", "end": "2025-09-15T10:00:00-04:00" }
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Condition",
+        "id": "cond-htn",
+        "clinicalStatus": { "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/condition-clinical", "code": "active" }]},
+        "code": { "coding": [{ "system": "http://snomed.info/sct", "code": "59621000", "display": "Essential hypertension (disorder)"}] },
+        "subject": { "reference": "Patient/pat-001" },
+        "encounter": { "reference": "Encounter/enc-pcp-2025-09-15" },
+        "onsetDateTime": "2025-09-15"
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "Observation",
+        "id": "obs-bp",
+        "status": "final",
+        "category": [{ "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/observation-category", "code": "vital-signs"}]}],
+        "code": { "coding": [{ "system": "http://loinc.org", "code": "85354-9", "display": "Blood pressure panel" }]},
+        "subject": { "reference": "Patient/pat-001" },
+        "encounter": { "reference": "Encounter/enc-pcp-2025-09-15" },
+        "effectiveDateTime": "2025-09-15T09:45:00-04:00",
+        "component": [
+          { "code": { "coding": [{ "system": "http://loinc.org", "code": "8480-6", "display": "Systolic" }]}, "valueQuantity": { "value": 148, "unit": "mmHg" } },
+          { "code": { "coding": [{ "system": "http://loinc.org", "code": "8462-4", "display": "Diastolic" }]}, "valueQuantity": { "value": 94, "unit": "mmHg" } }
+        ]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "MedicationRequest",
+        "id": "med-lisinopril",
+        "status": "active",
+        "intent": "order",
+        "medicationCodeableConcept": { "coding": [{ "system": "http://www.nlm.nih.gov/research/umls/rxnorm", "code": "29046", "display": "Lisinopril 10 MG Oral Tablet"}]},
+        "subject": { "reference": "Patient/pat-001" },
+        "authoredOn": "2025-09-15",
+        "requester": { "reference": "Practitioner/prac-pcp" },
+        "dosageInstruction": [{ "text": "10 mg once daily" }]
+      }
+    },
+    {
+      "resource": {
+        "resourceType": "ServiceRequest",
+        "id": "sr-cardiology-ref",
+        "status": "active",
+        "intent": "order",
+        "category": [{ "coding": [{ "system": "http://snomed.info/sct", "code": "125154007", "display": "Referral to cardiology service"}]}],
+        "subject": { "reference": "Patient/pat-001" },
+        "requester": { "reference": "Practitioner/prac-pcp" },
+        "reasonCode": [{ "coding": [{ "system": "http://snomed.info/sct", "code": "59621000", "display": "Essential hypertension"}]}]
+      }
+    }
+  ]
+}
