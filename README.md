@@ -1,3 +1,28 @@
+# patient-web — Prometheus Chains
+Web MVP for **patient-owned records**: anchor plaintext hash on L1 (Ethereum), encrypt & store on L2 (Base), and **Restore** via wallet-derived keys.
+
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+
+## ✨ What it does
+- **Anchor-first workflow**: Canonicalize FHIR JSON → SHA-256 → `contentHash` → append to your `PatientRecord` on L1.  
+- **Encrypt & store**: Derive {tag, key, nonce} from a one-time EIP-712 signature; encrypt with **AES-GCM**; store ciphertext in the L2 **Vault** by secret tag.  
+- **Restore**: Re-derive {tag, key, nonce}, fetch ciphertext by tag, decrypt locally, and verify `SHA-256(pt) == contentHash` from L1.  
+  (Integrity & ordering on L1; storage & privacy on L2.)  
+  _Implementation details match the app code and workflow spec._  
+
+## 🧭 How it works (at a glance)
+1) **Ensure record** (deploy/lookup your `PatientRecord`).  
+2) **Authorize key derivation** (EIP-712 sign → in-memory session root).  
+3) **Anchor on L1** (hash canonical FHIR JSON → `anchor(contentHash, l2ChainId)`).  
+4) **Encrypt & store on L2** (deterministic tag/key/nonce → `Vault.put(ciphertext, tag)`).  
+5) **Restore** (loop i=1..seq: derive → fetch → decrypt → verify).
+
+## 🧑‍💻 Quickstart
+```bash
+pnpm i
+pnpm dev
+
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
